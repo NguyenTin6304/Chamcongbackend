@@ -18,7 +18,7 @@ from sqlalchemy import event
 from app.core.db import Base, SessionLocal, engine
 from app.core.security import hash_password
 from app.main import app
-from app.models import AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, User
+from app.models import AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, RefreshToken, User
 
 
 class _BoolOr:
@@ -72,6 +72,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
     def setUp(self) -> None:
         with SessionLocal() as db:
             db.query(AttendanceLog).delete()
+            db.query(RefreshToken).delete()
             db.query(Employee).delete()
             db.query(GroupGeofence).delete()
             db.query(Group).delete()
@@ -157,12 +158,19 @@ class MinimumFlowsTestCase(unittest.TestCase):
             db.refresh(rule)
             return rule
 
-    def _login(self, email: str, password: str) -> str:
-        response = self.client.post("/auth/login", json={"email": email, "password": password})
+    def _login_tokens(self, email: str, password: str, remember_me: bool = True) -> dict:
+        response = self.client.post(
+            "/auth/login",
+            json={"email": email, "password": password, "remember_me": remember_me},
+        )
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
         self.assertIn("access_token", body)
-        return body["access_token"]
+        self.assertIn("refresh_token", body)
+        return body
+
+    def _login(self, email: str, password: str) -> str:
+        return self._login_tokens(email, password)["access_token"]
 
     def test_register_login_flow(self) -> None:
         email = "flow_user@example.com"
@@ -177,6 +185,68 @@ class MinimumFlowsTestCase(unittest.TestCase):
         me_res = self.client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
         self.assertEqual(me_res.status_code, 200, me_res.text)
         self.assertEqual(me_res.json()["email"], email)
+
+    def test_refresh_token_flow(self) -> None:
+        email = "refresh_user@example.com"
+        password = "user123"
+        self._create_user(email=email, password=password, role="USER")
+
+        login_body = self._login_tokens(email, password, remember_me=True)
+        old_refresh = login_body["refresh_token"]
+        old_access = login_body["access_token"]
+
+        refresh_res = self.client.post("/auth/refresh", json={"refresh_token": old_refresh})
+        self.assertEqual(refresh_res.status_code, 200, refresh_res.text)
+        refreshed = refresh_res.json()
+        self.assertIn("access_token", refreshed)
+        self.assertIn("refresh_token", refreshed)
+        self.assertNotEqual(refreshed["access_token"], old_access)
+        self.assertNotEqual(refreshed["refresh_token"], old_refresh)
+
+        old_refresh_res = self.client.post("/auth/refresh", json={"refresh_token": old_refresh})
+        self.assertEqual(old_refresh_res.status_code, 401, old_refresh_res.text)
+
+    def test_logout_and_logout_all_flow(self) -> None:
+        email = "logout_user@example.com"
+        password = "user123"
+        self._create_user(email=email, password=password, role="USER")
+
+        first_login = self._login_tokens(email, password, remember_me=True)
+        second_login = self._login_tokens(email, password, remember_me=True)
+
+        logout_res = self.client.post("/auth/logout", json={"refresh_token": first_login["refresh_token"]})
+        self.assertEqual(logout_res.status_code, 200, logout_res.text)
+
+        refresh_after_logout = self.client.post(
+            "/auth/refresh",
+            json={"refresh_token": first_login["refresh_token"]},
+        )
+        self.assertEqual(refresh_after_logout.status_code, 401, refresh_after_logout.text)
+
+        logout_all_res = self.client.post(
+            "/auth/logout-all",
+            headers={"Authorization": f"Bearer {second_login['access_token']}"},
+        )
+        self.assertEqual(logout_all_res.status_code, 200, logout_all_res.text)
+
+        refresh_after_logout_all = self.client.post(
+            "/auth/refresh",
+            json={"refresh_token": second_login["refresh_token"]},
+        )
+        self.assertEqual(refresh_after_logout_all.status_code, 401, refresh_after_logout_all.text)
+
+        with SessionLocal() as db:
+            user = db.query(User).filter(User.email == email).first()
+            self.assertIsNotNone(user)
+            active_count = (
+                db.query(RefreshToken)
+                .filter(
+                    RefreshToken.user_id == user.id,
+                    RefreshToken.revoked_at.is_(None),
+                )
+                .count()
+            )
+            self.assertEqual(active_count, 0)
 
     def test_set_rule_flow(self) -> None:
         self._create_user(email="admin@example.com", password="admin123", role="ADMIN")
@@ -543,6 +613,11 @@ class MinimumFlowsTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+
+
 
 
 

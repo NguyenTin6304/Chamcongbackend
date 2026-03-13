@@ -224,7 +224,7 @@ def my_attendance_status(db: Session = Depends(get_db), user: User = Depends(get
             last_action_time=None,
             can_checkin=True,
             can_checkout=False,
-            message="Ban chua check-in trong ca hien tai",
+            message="Bạn chưa check-in trong ca hiện tại",
         )
 
     if last.type == "IN":
