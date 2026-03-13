@@ -1,4 +1,4 @@
-﻿from datetime import date, datetime
+﻿from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -14,6 +14,8 @@ from app.core.deps import require_admin
 from app.models import AttendanceLog, Employee, Group
 
 router = APIRouter(prefix="/reports", tags=["reports"])
+VN_TZ = timezone(timedelta(hours=7))
+UTC_TZ = timezone.utc
 
 
 def _rank_to_punctuality(rank_value) -> str | None:
@@ -37,7 +39,12 @@ def _fetch_daily_report_rows(
     employee_id: int | None,
     group_id: int | None,
 ):
-    work_date_expr = func.date(AttendanceLog.time)
+    dialect = db.bind.dialect.name if db.bind is not None else ""
+    if dialect == "postgresql":
+        # Group report by Vietnam calendar date regardless of server/database timezone.
+        work_date_expr = func.date(func.timezone("Asia/Ho_Chi_Minh", AttendanceLog.time))
+    else:
+        work_date_expr = func.date(AttendanceLog.time)
 
     checkin_time_expr = func.min(
         case((AttendanceLog.type == "IN", AttendanceLog.time), else_=None)
@@ -148,9 +155,19 @@ def _to_excel_date(value: date | datetime | str | None) -> str | None:
 def _to_excel_datetime(value: datetime | str | None) -> str | None:
     if value is None:
         return None
+
     if isinstance(value, str):
-        return value
-    return value.isoformat(sep=" ", timespec="seconds")
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+        value = parsed
+
+    if value.tzinfo is None:
+        # Defensive: if DB driver returns naive datetime, treat it as UTC.
+        value = value.replace(tzinfo=UTC_TZ)
+
+    return value.astimezone(VN_TZ).isoformat(sep=" ", timespec="seconds")
 
 
 @router.get("/attendance.xlsx")
