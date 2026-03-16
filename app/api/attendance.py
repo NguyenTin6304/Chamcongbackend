@@ -1,4 +1,4 @@
-﻿from datetime import date, datetime, time, timezone
+﻿from datetime import date, datetime, time, timedelta, timezone
 from typing import NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_admin
-from app.models import AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, User
+from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, User
 from app.schemas.attendance import (
     AttendanceDailyReportResponse,
     AttendanceLogResponse,
@@ -15,7 +15,7 @@ from app.schemas.attendance import (
     CheckActionResponse,
     LocationRequest,
 )
-from app.services.attendance_time import classify_checkin_status, classify_checkout_status
+from app.services.attendance_time import VN_TZ, classify_checkin_status, classify_checkout_status, to_vn_time
 from app.services.geo import haversine_m
 
 router = APIRouter(prefix="/attendance", tags=["attendance"])
@@ -33,6 +33,15 @@ class _EffectiveTimeRule(NamedTuple):
     grace_minutes: int
     end_time: time
     checkout_grace_minutes: int
+
+
+class _DayLogsState(NamedTuple):
+    day_start_utc: datetime
+    day_end_utc: datetime
+    work_date: date
+    has_in: bool
+    has_out: bool
+    latest_today_log: AttendanceLog | None
 
 
 def _find_employee_for_user(db: Session, user: User) -> Employee | None:
@@ -167,6 +176,93 @@ def _last_log(db: Session, employee_id: int) -> AttendanceLog | None:
     )
 
 
+def _vn_work_date(value: datetime) -> date:
+    return to_vn_time(value).date()
+
+
+
+def _vn_day_bounds_utc(now_utc: datetime) -> tuple[datetime, datetime, date]:
+    vn_now = to_vn_time(now_utc)
+    day_start_vn = datetime.combine(vn_now.date(), time.min, tzinfo=VN_TZ)
+    day_end_vn = day_start_vn + timedelta(days=1)
+    return day_start_vn.astimezone(timezone.utc), day_end_vn.astimezone(timezone.utc), vn_now.date()
+
+
+def _get_day_logs_state(db: Session, employee_id: int, now_utc: datetime) -> _DayLogsState:
+    day_start_utc, day_end_utc, work_date = _vn_day_bounds_utc(now_utc)
+    day_logs = (
+        db.query(AttendanceLog)
+        .filter(
+            AttendanceLog.employee_id == employee_id,
+            AttendanceLog.time >= day_start_utc,
+            AttendanceLog.time < day_end_utc,
+        )
+        .order_by(AttendanceLog.time.desc())
+        .all()
+    )
+    has_in = any(log.type == "IN" for log in day_logs)
+    has_out = any(log.type == "OUT" for log in day_logs)
+    latest_today_log = day_logs[0] if day_logs else None
+    return _DayLogsState(
+        day_start_utc=day_start_utc,
+        day_end_utc=day_end_utc,
+        work_date=work_date,
+        has_in=has_in,
+        has_out=has_out,
+        latest_today_log=latest_today_log,
+    )
+
+
+def _find_open_in_before_day(db: Session, employee_id: int, day_start_utc: datetime) -> AttendanceLog | None:
+    last_before_day = (
+        db.query(AttendanceLog)
+        .filter(
+            AttendanceLog.employee_id == employee_id,
+            AttendanceLog.time < day_start_utc,
+        )
+        .order_by(AttendanceLog.time.desc())
+        .first()
+    )
+    if last_before_day and last_before_day.type == "IN":
+        return last_before_day
+    return None
+
+def _is_cross_day_open_in(last: AttendanceLog, now_utc: datetime) -> bool:
+    if last.type != "IN":
+        return False
+    return _vn_work_date(last.time) < _vn_work_date(now_utc)
+
+
+def _format_vn_date(value: date) -> str:
+    return value.strftime("%d/%m")
+
+
+def _ensure_missed_checkout_exception(
+    db: Session,
+    emp: Employee,
+    source_checkin_log: AttendanceLog,
+) -> tuple[AttendanceException, bool]:
+    existing = (
+        db.query(AttendanceException)
+        .filter(AttendanceException.source_checkin_log_id == source_checkin_log.id)
+        .first()
+    )
+    if existing:
+        return existing, False
+
+    exception = AttendanceException(
+        employee_id=emp.id,
+        source_checkin_log_id=source_checkin_log.id,
+        exception_type="MISSED_CHECKOUT",
+        work_date=_vn_work_date(source_checkin_log.time),
+        status="OPEN",
+        note="Detected cross-day open check-in",
+    )
+    db.add(exception)
+    db.flush()
+    return exception, True
+
+
 def _to_log_response(log: AttendanceLog) -> AttendanceLogResponse:
     return AttendanceLogResponse(
         id=log.id,
@@ -214,40 +310,73 @@ def my_attendance_status(db: Session = Depends(get_db), user: User = Depends(get
             message="Tài khoản chưa được gán employee",
         )
 
-    last = _last_log(db, emp.id)
-    if not last:
+    now_utc = datetime.now(timezone.utc)
+    day_state = _get_day_logs_state(db, emp.id, now_utc)
+
+    if day_state.has_in and day_state.has_out:
         return AttendanceStatusResponse(
             employee_assigned=True,
             employee_id=emp.id,
             current_state="OUT",
-            last_action=None,
-            last_action_time=None,
-            can_checkin=True,
+            last_action=day_state.latest_today_log.type if day_state.latest_today_log else None,
+            last_action_time=day_state.latest_today_log.time if day_state.latest_today_log else None,
+            can_checkin=False,
             can_checkout=False,
-            message="Bạn chưa check-in trong ca hiện tại",
+            message="Bạn đã hoàn thành ca hôm nay.",
         )
 
-    if last.type == "IN":
+    if day_state.has_in and not day_state.has_out:
         return AttendanceStatusResponse(
             employee_assigned=True,
             employee_id=emp.id,
             current_state="IN",
             last_action="IN",
-            last_action_time=last.time,
+            last_action_time=day_state.latest_today_log.time if day_state.latest_today_log else None,
             can_checkin=False,
             can_checkout=True,
-            message="Bạn đang ở trạng thái check-in",
+            message="Bạn đang ở trạng thái check-in trong ca hôm nay.",
         )
 
+    if not day_state.has_in and day_state.has_out:
+        return AttendanceStatusResponse(
+            employee_assigned=True,
+            employee_id=emp.id,
+            current_state="OUT",
+            last_action="OUT",
+            last_action_time=day_state.latest_today_log.time if day_state.latest_today_log else None,
+            can_checkin=False,
+            can_checkout=False,
+            message="Hôm nay bạn đã checkout, không thể thao tác thêm.",
+        )
+
+    open_cross_day_in = _find_open_in_before_day(db, emp.id, day_state.day_start_utc)
+    if open_cross_day_in:
+        exception, _ = _ensure_missed_checkout_exception(db, emp, open_cross_day_in)
+        db.commit()
+        warning_date = exception.work_date
+        return AttendanceStatusResponse(
+            employee_assigned=True,
+            employee_id=emp.id,
+            current_state="OUT",
+            last_action="IN",
+            last_action_time=open_cross_day_in.time,
+            can_checkin=True,
+            can_checkout=False,
+            message=f"Hôm trước quên checkout ({_format_vn_date(warning_date)}). Hôm nay bạn có thể check-in bình thường.",
+            warning_code="MISSED_CHECKOUT",
+            warning_date=warning_date,
+        )
+
+    last = _last_log(db, emp.id)
     return AttendanceStatusResponse(
         employee_assigned=True,
         employee_id=emp.id,
         current_state="OUT",
-        last_action="OUT",
-        last_action_time=last.time,
+        last_action=last.type if last else None,
+        last_action_time=last.time if last else None,
         can_checkin=True,
         can_checkout=False,
-        message="Bạn đang ở trạng thái checkout",
+        message="Bạn chưa check-in trong ca hiện tại",
     )
 
 
@@ -259,11 +388,20 @@ def checkin(payload: LocationRequest, db: Session = Depends(get_db), user: User 
     using_fallback_rule = geofence_source == "SYSTEM_FALLBACK"
     time_rule = _get_effective_time_rule(db, emp, active_rule)
 
-    last = _last_log(db, emp.id)
-    if last and last.type == "IN":
-        raise HTTPException(status_code=400, detail="Bạn đã CHECK-IN rồi. Hãy CHECK-OUT trước.")
-
     checkin_at = datetime.now(timezone.utc)
+    day_state = _get_day_logs_state(db, emp.id, checkin_at)
+
+    if day_state.has_in and not day_state.has_out:
+        raise HTTPException(status_code=400, detail="Hôm nay bạn đã CHECK-IN. Hãy CHECK-OUT trước.")
+    if day_state.has_out:
+        raise HTTPException(status_code=400, detail="Bạn đã hoàn thành ca hôm nay. Không thể CHECK-IN lại.")
+
+    missed_checkout_warning_date: date | None = None
+    open_cross_day_in = _find_open_in_before_day(db, emp.id, day_state.day_start_utc)
+    if open_cross_day_in:
+        exception, _ = _ensure_missed_checkout_exception(db, emp, open_cross_day_in)
+        missed_checkout_warning_date = exception.work_date
+
     punctuality_status = classify_checkin_status(
         checkin_at,
         time_rule.start_time,
@@ -305,6 +443,9 @@ def checkin(payload: LocationRequest, db: Session = Depends(get_db), user: User 
     elif using_fallback_rule:
         msg = f"Check-in thành công ({punctuality_status}) theo rule fallback hệ thống ({fallback_reason})."
 
+    if missed_checkout_warning_date is not None:
+        msg = f"{msg} Lưu ý: hôm trước bạn quên checkout ({_format_vn_date(missed_checkout_warning_date)}), hệ thống đã ghi nhận ngoại lệ."
+
     return CheckActionResponse(
         log=_to_log_response(log),
         message=msg,
@@ -321,11 +462,23 @@ def checkout(payload: LocationRequest, db: Session = Depends(get_db), user: User
     using_fallback_rule = geofence_source == "SYSTEM_FALLBACK"
     time_rule = _get_effective_time_rule(db, emp, active_rule)
 
-    last = _last_log(db, emp.id)
-    if not last or last.type != "IN":
-        raise HTTPException(status_code=400, detail="Bạn chưa CHECK-IN hoặc đã CHECK-OUT rồi.")
-
     checkout_at = datetime.now(timezone.utc)
+    day_state = _get_day_logs_state(db, emp.id, checkout_at)
+
+    if day_state.has_out:
+        raise HTTPException(status_code=400, detail="Hôm nay bạn đã CHECK-OUT rồi.")
+
+    if not day_state.has_in:
+        open_cross_day_in = _find_open_in_before_day(db, emp.id, day_state.day_start_utc)
+        if open_cross_day_in:
+            exception, _ = _ensure_missed_checkout_exception(db, emp, open_cross_day_in)
+            db.commit()
+            raise HTTPException(
+                status_code=400,
+                detail=f"Bạn đã quên checkout ngày {_format_vn_date(exception.work_date)}. Hãy check-in ca mới.",
+            )
+        raise HTTPException(status_code=400, detail="Hôm nay bạn chưa CHECK-IN.")
+
     checkout_status = classify_checkout_status(
         checkout_at,
         time_rule.end_time,
@@ -541,9 +694,5 @@ def list_logs_admin(
 
     logs = q.order_by(AttendanceLog.time.desc()).all()
     return [_to_log_response(x) for x in logs]
-
-
-
-
 
 

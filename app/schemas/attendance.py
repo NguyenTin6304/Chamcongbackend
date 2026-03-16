@@ -5,6 +5,8 @@ from pydantic import AliasChoices, BaseModel, Field
 
 PunctualityStatus = Literal["EARLY", "ON_TIME", "LATE"]
 GeofenceSource = Literal["GROUP", "SYSTEM_FALLBACK"]
+AttendanceExceptionType = Literal["MISSED_CHECKOUT", "AUTO_CLOSED"]
+AttendanceExceptionStatus = Literal["OPEN", "RESOLVED"]
 
 
 class LocationRequest(BaseModel):
@@ -45,6 +47,8 @@ class AttendanceStatusResponse(BaseModel):
     can_checkin: bool
     can_checkout: bool
     message: str
+    warning_code: Literal["MISSED_CHECKOUT"] | None = None
+    warning_date: date | None = None
 
 
 class AttendanceDailyReportResponse(BaseModel):
@@ -63,3 +67,20 @@ class AttendanceDailyReportResponse(BaseModel):
     out_of_range: bool
     avg_distance_m: float | None = None
     max_distance_m: float | None = None
+
+
+class AttendanceExceptionReportResponse(BaseModel):
+    id: int
+    employee_id: int
+    employee_code: str
+    full_name: str
+    group_code: str | None = None
+    group_name: str | None = None
+    work_date: date
+    exception_type: AttendanceExceptionType
+    status: AttendanceExceptionStatus
+    note: str | None = None
+    source_checkin_log_id: int
+    source_checkin_time: datetime | None = None
+    created_at: datetime | None = None
+    resolved_at: datetime | None = None

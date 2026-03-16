@@ -18,7 +18,7 @@ from sqlalchemy import event
 from app.core.db import Base, SessionLocal, engine
 from app.core.security import hash_password
 from app.main import app
-from app.models import AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, RefreshToken, User
+from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, RefreshToken, User
 
 
 class _BoolOr:
@@ -71,6 +71,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
 
     def setUp(self) -> None:
         with SessionLocal() as db:
+            db.query(AttendanceException).delete()
             db.query(AttendanceLog).delete()
             db.query(RefreshToken).delete()
             db.query(Employee).delete()
@@ -344,6 +345,20 @@ class MinimumFlowsTestCase(unittest.TestCase):
         self.assertEqual(checkout_res.json()["log"]["type"], "OUT")
         self.assertIn(checkout_res.json()["log"].get("checkout_status"), {"EARLY", "ON_TIME", "LATE"})
 
+        repeat_checkin_same_day = self.client.post(
+            "/attendance/checkin",
+            headers=headers,
+            json={"lat": 10.7769, "lng": 106.7009},
+        )
+        self.assertEqual(repeat_checkin_same_day.status_code, 400, repeat_checkin_same_day.text)
+
+        status_res = self.client.get("/attendance/status", headers=headers)
+        self.assertEqual(status_res.status_code, 200, status_res.text)
+        status_body = status_res.json()
+        self.assertFalse(status_body["can_checkin"])
+        self.assertFalse(status_body["can_checkout"])
+
+
     def test_group_geofence_flow(self) -> None:
         user = self._create_user(email="group_user@example.com", password="user123", role="USER")
 
@@ -551,6 +566,121 @@ class MinimumFlowsTestCase(unittest.TestCase):
             deleted_geofence = db.query(GroupGeofence).filter(GroupGeofence.group_id == group.id).first()
             self.assertIsNone(deleted_geofence)
 
+    def test_cross_day_open_in_allows_new_checkin_and_creates_exception(self) -> None:
+        user = self._create_user(email="crossday_user@example.com", password="user123", role="USER")
+        self._create_employee(code="EM010", full_name="Cross Day User", user_id=user.id)
+        self._create_rule(latitude=10.7769, longitude=106.7009, radius_m=300)
+
+        token = self._login("crossday_user@example.com", "user123")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 10, 2, 0, tzinfo=timezone.utc)  # 09:00 VN
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            day1_in = self.client.post(
+                "/attendance/checkin",
+                headers=headers,
+                json={"lat": 10.7769, "lng": 106.7009},
+            )
+        self.assertEqual(day1_in.status_code, 200, day1_in.text)
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 11, 2, 0, tzinfo=timezone.utc)  # next day 09:00 VN
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            status_res = self.client.get("/attendance/status", headers=headers)
+        self.assertEqual(status_res.status_code, 200, status_res.text)
+        status_body = status_res.json()
+        self.assertTrue(status_body["can_checkin"])
+        self.assertFalse(status_body["can_checkout"])
+        self.assertEqual(status_body["warning_code"], "MISSED_CHECKOUT")
+
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            day2_in = self.client.post(
+                "/attendance/checkin",
+                headers=headers,
+                json={"lat": 10.7769, "lng": 106.7009},
+            )
+        self.assertEqual(day2_in.status_code, 200, day2_in.text)
+
+        with SessionLocal() as db:
+            emp = db.query(Employee).filter(Employee.user_id == user.id).first()
+            self.assertIsNotNone(emp)
+            exceptions = db.query(AttendanceException).filter(AttendanceException.employee_id == emp.id).all()
+            self.assertEqual(len(exceptions), 1)
+            self.assertEqual(exceptions[0].exception_type, "MISSED_CHECKOUT")
+
+        _FixedDateTime.fixed_now = None
+
+    def test_same_day_open_in_still_blocks_second_checkin(self) -> None:
+        user = self._create_user(email="same_day_user@example.com", password="user123", role="USER")
+        self._create_employee(code="EM011", full_name="Same Day User", user_id=user.id)
+        self._create_rule(latitude=10.7769, longitude=106.7009, radius_m=300)
+
+        token = self._login("same_day_user@example.com", "user123")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 11, 2, 0, tzinfo=timezone.utc)
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            first_in = self.client.post(
+                "/attendance/checkin",
+                headers=headers,
+                json={"lat": 10.7769, "lng": 106.7009},
+            )
+            second_in = self.client.post(
+                "/attendance/checkin",
+                headers=headers,
+                json={"lat": 10.7769, "lng": 106.7009},
+            )
+
+        self.assertEqual(first_in.status_code, 200, first_in.text)
+        self.assertEqual(second_in.status_code, 400, second_in.text)
+
+        with SessionLocal() as db:
+            emp = db.query(Employee).filter(Employee.user_id == user.id).first()
+            self.assertIsNotNone(emp)
+            count_exceptions = db.query(AttendanceException).filter(AttendanceException.employee_id == emp.id).count()
+            self.assertEqual(count_exceptions, 0)
+
+        _FixedDateTime.fixed_now = None
+
+    def test_exception_report_contains_missed_checkout_row(self) -> None:
+        admin = self._create_user(email="admin_exc@example.com", password="admin123", role="ADMIN")
+        user = self._create_user(email="user_exc@example.com", password="user123", role="USER")
+
+        self._create_employee(code="EM012", full_name="Exception User", user_id=user.id)
+        self._create_rule(latitude=10.7769, longitude=106.7009, radius_m=300)
+
+        user_token = self._login("user_exc@example.com", "user123")
+        user_headers = {"Authorization": f"Bearer {user_token}"}
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 10, 2, 0, tzinfo=timezone.utc)  # 10/03 VN
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            day1_in = self.client.post(
+                "/attendance/checkin",
+                headers=user_headers,
+                json={"lat": 10.7769, "lng": 106.7009},
+            )
+        self.assertEqual(day1_in.status_code, 200, day1_in.text)
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 11, 2, 0, tzinfo=timezone.utc)
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            status_res = self.client.get("/attendance/status", headers=user_headers)
+        self.assertEqual(status_res.status_code, 200, status_res.text)
+
+        admin_token = self._login("admin_exc@example.com", "admin123")
+        report_res = self.client.get(
+            "/reports/attendance-exceptions?from=2026-03-10&to=2026-03-10",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        self.assertEqual(report_res.status_code, 200, report_res.text)
+
+        rows = report_res.json()
+        self.assertTrue(any(row["employee_code"] == "EM012" for row in rows))
+
+        target = next(row for row in rows if row["employee_code"] == "EM012")
+        self.assertEqual(target["exception_type"], "MISSED_CHECKOUT")
+        self.assertEqual(target["status"], "OPEN")
+        self.assertEqual(target["work_date"], "2026-03-10")
+
+        _FixedDateTime.fixed_now = None
     def test_export_report_flow(self) -> None:
         admin = self._create_user(email="admin_report@example.com", password="admin123", role="ADMIN")
         user = self._create_user(email="user_report@example.com", password="user123", role="USER")
@@ -613,25 +743,4 @@ class MinimumFlowsTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 

@@ -1,6 +1,6 @@
 ﻿from datetime import time
 
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text, Time
+from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, Text, Time
 from sqlalchemy.sql import func
 
 from app.core.db import Base
@@ -16,7 +16,6 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
-
 class RefreshToken(Base):
     __tablename__ = "refresh_tokens"
 
@@ -29,7 +28,8 @@ class RefreshToken(Base):
     expires_at = Column(DateTime(timezone=True), nullable=False)
     revoked_at = Column(DateTime(timezone=True), nullable=True)
     replaced_by_jti = Column(String(64), nullable=True)
-    
+
+
 class Group(Base):
     __tablename__ = "groups"
 
@@ -111,3 +111,16 @@ class AttendanceLog(Base):
     fallback_reason = Column(String(100), nullable=True)
     address_text = Column(Text, nullable=True)
 
+
+class AttendanceException(Base):
+    __tablename__ = "attendance_exceptions"
+
+    id = Column(Integer, primary_key=True)
+    employee_id = Column(Integer, ForeignKey("employees.id"), nullable=False, index=True)
+    source_checkin_log_id = Column(Integer, ForeignKey("attendance_logs.id"), nullable=False, unique=True)
+    exception_type = Column(String(50), nullable=False, index=True)  # MISSED_CHECKOUT/AUTO_CLOSED
+    work_date = Column(Date, nullable=False)
+    status = Column(String(20), nullable=False, default="OPEN")  # OPEN/RESOLVED
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    resolved_at = Column(DateTime(timezone=True), nullable=True)

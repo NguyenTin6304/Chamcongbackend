@@ -9,9 +9,11 @@ from openpyxl.utils import get_column_letter
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
+from app.schemas.attendance import AttendanceExceptionReportResponse
+
 from app.core.db import get_db
 from app.core.deps import require_admin
-from app.models import AttendanceLog, Employee, Group
+from app.models import AttendanceException, AttendanceLog, Employee, Group
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 VN_TZ = timezone(timedelta(hours=7))
@@ -291,3 +293,82 @@ def export_attendance_report_excel(
         headers=headers_response,
     )
 
+
+
+@router.get("/attendance-exceptions", response_model=list[AttendanceExceptionReportResponse])
+def list_attendance_exceptions(
+    from_date: date | None = Query(None, alias="from"),
+    to_date: date | None = Query(None, alias="to"),
+    employee_id: int | None = None,
+    group_id: int | None = None,
+    exception_type: str = "MISSED_CHECKOUT",
+    status_filter: str | None = Query(None, alias="status"),
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    if from_date and to_date and from_date > to_date:
+        raise HTTPException(status_code=400, detail="'from' must be <= 'to'")
+
+    normalized_exception_type = exception_type.strip().upper()
+    if normalized_exception_type not in {"MISSED_CHECKOUT", "AUTO_CLOSED"}:
+        raise HTTPException(status_code=400, detail="exception_type must be MISSED_CHECKOUT or AUTO_CLOSED")
+
+    normalized_status = status_filter.strip().upper() if status_filter else None
+    if normalized_status and normalized_status not in {"OPEN", "RESOLVED"}:
+        raise HTTPException(status_code=400, detail="status must be OPEN or RESOLVED")
+
+    q = (
+        db.query(
+            AttendanceException.id.label("id"),
+            AttendanceException.employee_id.label("employee_id"),
+            Employee.code.label("employee_code"),
+            Employee.full_name.label("full_name"),
+            Group.code.label("group_code"),
+            Group.name.label("group_name"),
+            AttendanceException.work_date.label("work_date"),
+            AttendanceException.exception_type.label("exception_type"),
+            AttendanceException.status.label("status"),
+            AttendanceException.note.label("note"),
+            AttendanceException.source_checkin_log_id.label("source_checkin_log_id"),
+            AttendanceLog.time.label("source_checkin_time"),
+            AttendanceException.created_at.label("created_at"),
+            AttendanceException.resolved_at.label("resolved_at"),
+        )
+        .join(Employee, Employee.id == AttendanceException.employee_id)
+        .outerjoin(Group, Group.id == Employee.group_id)
+        .outerjoin(AttendanceLog, AttendanceLog.id == AttendanceException.source_checkin_log_id)
+        .filter(AttendanceException.exception_type == normalized_exception_type)
+    )
+
+    if employee_id:
+        q = q.filter(AttendanceException.employee_id == employee_id)
+    if group_id:
+        q = q.filter(Employee.group_id == group_id)
+    if from_date:
+        q = q.filter(AttendanceException.work_date >= from_date)
+    if to_date:
+        q = q.filter(AttendanceException.work_date <= to_date)
+    if normalized_status:
+        q = q.filter(AttendanceException.status == normalized_status)
+
+    rows = q.order_by(AttendanceException.work_date.desc(), AttendanceException.created_at.desc()).all()
+
+    return [
+        AttendanceExceptionReportResponse(
+            id=row.id,
+            employee_id=row.employee_id,
+            employee_code=row.employee_code,
+            full_name=row.full_name,
+            group_code=row.group_code,
+            group_name=row.group_name,
+            work_date=row.work_date,
+            exception_type=row.exception_type,
+            status=row.status,
+            note=row.note,
+            source_checkin_log_id=row.source_checkin_log_id,
+            source_checkin_time=row.source_checkin_time,
+            created_at=row.created_at,
+            resolved_at=row.resolved_at,
+        )
+        for row in rows
+    ]
