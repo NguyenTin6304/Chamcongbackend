@@ -1,4 +1,6 @@
-﻿from fastapi import FastAPI, HTTPException, Request, status
+﻿import logging
+
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -10,14 +12,21 @@ from app.api.groups import router as groups_router
 from app.api.reports import router as reports_router
 from app.api.rules import router as rules_router
 from app.api.users import router as users_router
+from app.core.config import settings
 from app.core.db import Base, engine
 
 app = FastAPI(title="Attendance API")
+logger = logging.getLogger(__name__)
 
-# Dev-friendly CORS (needed for Swagger/browser and upcoming Flutter web).
+# Allow local Flutter web (localhost with any port) and Vercel deployments.
+# Avoid using "*" with credentials because browsers can block those requests.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost",
+        "http://127.0.0.1",
+    ],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$|^https://([a-zA-Z0-9-]+\.)*vercel\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -26,8 +35,9 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup_create_tables() -> None:
-    # Ensure tables exist after resetting database in local development.
-    Base.metadata.create_all(bind=engine)
+    # Keep Alembic as source of truth. Enable only for quick local demos.
+    if settings.AUTO_CREATE_TABLES:
+        Base.metadata.create_all(bind=engine)
 
 
 @app.get("/health")
@@ -89,7 +99,8 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError):
 
 
 @app.exception_handler(Exception)
-async def unhandled_exception_handler(_: Request, __: Exception):
+async def unhandled_exception_handler(_: Request, exc: Exception):
+    logger.exception("Unhandled exception", exc_info=exc)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
@@ -109,4 +120,3 @@ app.include_router(reports_router)
 app.include_router(rules_router)
 app.include_router(auth_router)
 app.include_router(users_router)
-

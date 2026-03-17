@@ -1,6 +1,7 @@
 ﻿from datetime import time
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
@@ -14,6 +15,7 @@ DEFAULT_START_TIME = time(8, 0)
 DEFAULT_GRACE_MINUTES = 30
 DEFAULT_END_TIME = time(17, 30)
 DEFAULT_CHECKOUT_GRACE_MINUTES = 0
+DEFAULT_CROSS_DAY_CUTOFF_MINUTES = 240
 
 
 def _to_rule_response(rule: CheckinRule) -> RuleResponse:
@@ -25,6 +27,7 @@ def _to_rule_response(rule: CheckinRule) -> RuleResponse:
         grace_minutes=rule.grace_minutes,
         end_time=rule.end_time,
         checkout_grace_minutes=rule.checkout_grace_minutes,
+        cross_day_cutoff_minutes=rule.cross_day_cutoff_minutes,
     )
 
 
@@ -62,6 +65,11 @@ def update_active_rule(
                 if payload.checkout_grace_minutes is not None
                 else DEFAULT_CHECKOUT_GRACE_MINUTES
             ),
+            cross_day_cutoff_minutes=(
+                payload.cross_day_cutoff_minutes
+                if payload.cross_day_cutoff_minutes is not None
+                else DEFAULT_CROSS_DAY_CUTOFF_MINUTES
+            ),
         )
         db.add(rule)
     else:
@@ -88,6 +96,27 @@ def update_active_rule(
         elif rule.checkout_grace_minutes is None:
             rule.checkout_grace_minutes = DEFAULT_CHECKOUT_GRACE_MINUTES
 
-    db.commit()
+        if payload.cross_day_cutoff_minutes is not None:
+            rule.cross_day_cutoff_minutes = payload.cross_day_cutoff_minutes
+        elif rule.cross_day_cutoff_minutes is None:
+            rule.cross_day_cutoff_minutes = DEFAULT_CROSS_DAY_CUTOFF_MINUTES
+
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        err = str(exc).lower()
+        if "cross_day_cutoff_minutes" in err and (
+            "does not exist" in err or "no such column" in err
+        ):
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "DB_MIGRATION_REQUIRED",
+                    "message": "Database schema chua cap nhat. Hay chay: alembic upgrade head",
+                },
+            )
+        raise HTTPException(status_code=500, detail="Failed to update active rule")
+
     db.refresh(rule)
     return _to_rule_response(rule)

@@ -11,6 +11,7 @@ class GroupCreateRequest(BaseModel):
     grace_minutes: int | None = Field(default=None, ge=0, le=240)
     end_time: time | None = None
     checkout_grace_minutes: int | None = Field(default=None, ge=0, le=240)
+    cross_day_cutoff_minutes: int | None = Field(default=None, ge=0, le=720)
 
     @field_validator("start_time", mode="before")
     @classmethod
@@ -49,6 +50,7 @@ class GroupUpdateRequest(BaseModel):
     grace_minutes: int | None = Field(default=None, ge=0, le=240)
     end_time: time | None = None
     checkout_grace_minutes: int | None = Field(default=None, ge=0, le=240)
+    cross_day_cutoff_minutes: int | None = Field(default=None, ge=0, le=720)
 
     @field_validator("start_time", mode="before")
     @classmethod
@@ -88,6 +90,7 @@ class GroupResponse(BaseModel):
     grace_minutes: int | None = None
     end_time: time | None = None
     checkout_grace_minutes: int | None = None
+    cross_day_cutoff_minutes: int | None = None
 
     @field_serializer("start_time")
     def serialize_start_time(self, value: time | None) -> str | None:

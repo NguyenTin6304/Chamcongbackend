@@ -5,6 +5,7 @@ from pydantic import AliasChoices, BaseModel, Field
 
 PunctualityStatus = Literal["EARLY", "ON_TIME", "LATE"]
 GeofenceSource = Literal["GROUP", "SYSTEM_FALLBACK"]
+TimeRuleSource = Literal["GROUP", "SYSTEM_FALLBACK"]
 AttendanceExceptionType = Literal["MISSED_CHECKOUT", "AUTO_CLOSED"]
 AttendanceExceptionStatus = Literal["OPEN", "RESOLVED"]
 
@@ -19,6 +20,7 @@ class AttendanceLogResponse(BaseModel):
     id: int
     type: str
     time: datetime
+    work_date: date | None = None
     lat: float
     lng: float
     distance_m: float | None = None
@@ -26,6 +28,8 @@ class AttendanceLogResponse(BaseModel):
     matched_geofence: str | None = None
     geofence_source: GeofenceSource | None = None
     fallback_reason: str | None = None
+    time_rule_source: TimeRuleSource | None = None
+    time_rule_fallback_reason: str | None = None
     is_out_of_range: bool
     punctuality_status: PunctualityStatus | None = None
     checkout_status: PunctualityStatus | None = None
@@ -47,7 +51,7 @@ class AttendanceStatusResponse(BaseModel):
     can_checkin: bool
     can_checkout: bool
     message: str
-    warning_code: Literal["MISSED_CHECKOUT"] | None = None
+    warning_code: Literal["MISSED_CHECKOUT", "AUTO_CLOSED"] | None = None
     warning_date: date | None = None
 
 
@@ -67,6 +71,10 @@ class AttendanceDailyReportResponse(BaseModel):
     out_of_range: bool
     avg_distance_m: float | None = None
     max_distance_m: float | None = None
+    regular_minutes: int | None = None
+    overtime_minutes: int | None = None
+    overtime_cross_day: bool | None = None
+    exception_status: AttendanceExceptionStatus | None = None
 
 
 class AttendanceExceptionReportResponse(BaseModel):

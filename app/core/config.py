@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS_NO_REMEMBER: int = 1
+    # Keep False by default so schema is managed by Alembic migrations.
+    AUTO_CREATE_TABLES: bool = False
 
     class Config:
         env_file = ".env"

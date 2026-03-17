@@ -37,6 +37,7 @@ def upsert_group(
     grace_minutes=None,
     end_time=None,
     checkout_grace_minutes=None,
+    cross_day_cutoff_minutes=None,
 ) -> Group:
     group = db.query(Group).filter(Group.code == code).first()
     if not group:
@@ -48,6 +49,7 @@ def upsert_group(
             grace_minutes=grace_minutes,
             end_time=end_time,
             checkout_grace_minutes=checkout_grace_minutes,
+            cross_day_cutoff_minutes=cross_day_cutoff_minutes,
         )
         db.add(group)
         db.flush()
@@ -59,6 +61,7 @@ def upsert_group(
     group.grace_minutes = grace_minutes
     group.end_time = end_time
     group.checkout_grace_minutes = checkout_grace_minutes
+    group.cross_day_cutoff_minutes = cross_day_cutoff_minutes
     db.flush()
     return group
 
@@ -122,7 +125,13 @@ def upsert_employee(
     return emp
 
 
-def upsert_active_rule(db: Session, latitude: float, longitude: float, radius_m: int) -> CheckinRule:
+def upsert_active_rule(
+    db: Session,
+    latitude: float,
+    longitude: float,
+    radius_m: int,
+    cross_day_cutoff_minutes: int,
+) -> CheckinRule:
     rule = db.query(CheckinRule).filter(CheckinRule.active.is_(True)).order_by(CheckinRule.id.asc()).first()
 
     if not rule:
@@ -133,6 +142,7 @@ def upsert_active_rule(db: Session, latitude: float, longitude: float, radius_m:
             latitude=latitude,
             longitude=longitude,
             radius_m=radius_m,
+            cross_day_cutoff_minutes=cross_day_cutoff_minutes,
             active=True,
         )
         db.add(rule)
@@ -141,6 +151,7 @@ def upsert_active_rule(db: Session, latitude: float, longitude: float, radius_m:
         rule.latitude = latitude
         rule.longitude = longitude
         rule.radius_m = radius_m
+        rule.cross_day_cutoff_minutes = cross_day_cutoff_minutes
         rule.active = True
         db.flush()
 
@@ -169,6 +180,7 @@ def seed(args: argparse.Namespace) -> None:
             grace_minutes=15,
             end_time=time(17, 30),
             checkout_grace_minutes=10,
+            cross_day_cutoff_minutes=240,
         )
         group_bt = upsert_group(
             db,
@@ -179,6 +191,7 @@ def seed(args: argparse.Namespace) -> None:
             grace_minutes=20,
             end_time=time(18, 0),
             checkout_grace_minutes=15,
+            cross_day_cutoff_minutes=300,
         )
 
         upsert_geofence(db, group_q1.id, "Cong chinh", 10.7769, 106.7009, 250, active=True)
@@ -190,7 +203,7 @@ def seed(args: argparse.Namespace) -> None:
         wh_emp = upsert_employee(db, args.warehouse_employee_code, args.warehouse_full_name, user_wh.id, group_bt.id)
 
         # Keep legacy system rule as fallback for old clients and ungrouped employees.
-        rule = upsert_active_rule(db, args.rule_lat, args.rule_lng, args.rule_radius)
+        rule = upsert_active_rule(db, args.rule_lat, args.rule_lng, args.rule_radius, args.rule_cutoff)
 
         db.commit()
 
@@ -198,17 +211,24 @@ def seed(args: argparse.Namespace) -> None:
         print(f"ADMIN user: {admin.email} (id={admin.id})")
         print(f"USER Q1:    {user_q1.email} (id={user_q1.id})")
         print(f"USER WH:    {user_wh.email} (id={user_wh.id})")
-        print(f"Group A: {group_q1.code} ({group_q1.name}) time={group_q1.start_time}-{group_q1.end_time}")
+        print(
+            f"Group A: {group_q1.code} ({group_q1.name}) "
+            f"time={group_q1.start_time}-{group_q1.end_time} cutoff={group_q1.cross_day_cutoff_minutes}"
+        )
         print("  - Cong chinh")
         print("  - Toa nha phu")
-        print(f"Group B: {group_bt.code} ({group_bt.name}) time={group_bt.start_time}-{group_bt.end_time}")
+        print(
+            f"Group B: {group_bt.code} ({group_bt.name}) "
+            f"time={group_bt.start_time}-{group_bt.end_time} cutoff={group_bt.cross_day_cutoff_minutes}"
+        )
         print("  - Kho trung tam")
         print(f"Employee: {admin_emp.code} -> user_id={admin_emp.user_id}, group_id={admin_emp.group_id}")
         print(f"Employee: {user_emp.code} -> user_id={user_emp.user_id}, group_id={user_emp.group_id}")
         print(f"Employee: {wh_emp.code} -> user_id={wh_emp.user_id}, group_id={wh_emp.group_id}")
         print(
             "Active fallback rule: "
-            f"lat={rule.latitude}, lng={rule.longitude}, radius_m={rule.radius_m}, active={rule.active}"
+            f"lat={rule.latitude}, lng={rule.longitude}, radius_m={rule.radius_m}, "
+            f"cutoff={rule.cross_day_cutoff_minutes}, active={rule.active}"
         )
     except Exception:
         db.rollback()
@@ -238,14 +258,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rule-lat", type=float, default=10.7769)
     parser.add_argument("--rule-lng", type=float, default=106.7009)
     parser.add_argument("--rule-radius", type=int, default=200)
+    parser.add_argument("--rule-cutoff", type=int, default=240)
 
     return parser
 
 
 if __name__ == "__main__":
     seed(build_parser().parse_args())
-
-
-
-
-

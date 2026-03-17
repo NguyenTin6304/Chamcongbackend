@@ -1,4 +1,4 @@
-﻿from datetime import date, datetime, timedelta, timezone
+﻿from datetime import date, datetime, time, timedelta, timezone
 from io import BytesIO
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -9,11 +9,11 @@ from openpyxl.utils import get_column_letter
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
-from app.schemas.attendance import AttendanceExceptionReportResponse
-
 from app.core.db import get_db
 from app.core.deps import require_admin
 from app.models import AttendanceException, AttendanceLog, Employee, Group
+from app.schemas.attendance import AttendanceExceptionReportResponse
+from app.services.attendance_time import split_regular_overtime_minutes
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 VN_TZ = timezone(timedelta(hours=7))
@@ -34,6 +34,15 @@ def _rank_to_geofence_source(rank_value) -> str | None:
     return mapping.get(int(rank_value))
 
 
+def _work_date_expr(db: Session):
+    dialect = db.bind.dialect.name if db.bind is not None else ""
+    if dialect == "postgresql":
+        legacy_expr = func.date(func.timezone("Asia/Ho_Chi_Minh", AttendanceLog.time))
+    else:
+        legacy_expr = func.date(AttendanceLog.time)
+    return func.coalesce(AttendanceLog.work_date, legacy_expr)
+
+
 def _fetch_daily_report_rows(
     db: Session,
     from_date: date | None,
@@ -41,19 +50,10 @@ def _fetch_daily_report_rows(
     employee_id: int | None,
     group_id: int | None,
 ):
-    dialect = db.bind.dialect.name if db.bind is not None else ""
-    if dialect == "postgresql":
-        # Group report by Vietnam calendar date regardless of server/database timezone.
-        work_date_expr = func.date(func.timezone("Asia/Ho_Chi_Minh", AttendanceLog.time))
-    else:
-        work_date_expr = func.date(AttendanceLog.time)
+    work_date_expr = _work_date_expr(db)
 
-    checkin_time_expr = func.min(
-        case((AttendanceLog.type == "IN", AttendanceLog.time), else_=None)
-    ).label("checkin_time")
-    checkout_time_expr = func.max(
-        case((AttendanceLog.type == "OUT", AttendanceLog.time), else_=None)
-    ).label("checkout_time")
+    checkin_time_expr = func.min(case((AttendanceLog.type == "IN", AttendanceLog.time), else_=None)).label("checkin_time")
+    checkout_time_expr = func.max(case((AttendanceLog.type == "OUT", AttendanceLog.time), else_=None)).label("checkout_time")
 
     punctuality_rank_expr = func.min(
         case(
@@ -99,17 +99,16 @@ def _fetch_daily_report_rows(
             else_=None,
         )
     ).label("geofence_source_rank")
-    fallback_reason_expr = func.max(
-        case((AttendanceLog.geofence_source == "SYSTEM_FALLBACK", AttendanceLog.fallback_reason), else_=None)
-    ).label("fallback_reason")
-
     out_of_range_expr = func.bool_or(AttendanceLog.is_out_of_range).label("out_of_range")
     avg_distance_expr = func.avg(AttendanceLog.distance_m).label("avg_distance_m")
     max_distance_expr = func.max(AttendanceLog.distance_m).label("max_distance_m")
+    shift_start_expr = func.max(case((AttendanceLog.type == "IN", AttendanceLog.snapshot_start_time), else_=None)).label("shift_start")
+    shift_end_expr = func.max(case((AttendanceLog.type == "IN", AttendanceLog.snapshot_end_time), else_=None)).label("shift_end")
 
     q = (
         db.query(
             work_date_expr.label("work_date"),
+            Employee.id.label("employee_id"),
             Employee.code.label("employee_code"),
             Employee.full_name.label("full_name"),
             Group.code.label("group_code"),
@@ -121,10 +120,11 @@ def _fetch_daily_report_rows(
             checkin_matched_geofence_expr,
             checkout_matched_geofence_expr,
             geofence_source_rank_expr,
-            fallback_reason_expr,
             out_of_range_expr,
             avg_distance_expr,
             max_distance_expr,
+            shift_start_expr,
+            shift_end_expr,
         )
         .join(Employee, Employee.id == AttendanceLog.employee_id)
         .outerjoin(Group, Group.id == Employee.group_id)
@@ -140,10 +140,41 @@ def _fetch_daily_report_rows(
         q = q.filter(work_date_expr <= to_date)
 
     return (
-        q.group_by(work_date_expr, Employee.code, Employee.full_name, Group.code, Group.name)
+        q.group_by(work_date_expr, Employee.id, Employee.code, Employee.full_name, Group.code, Group.name)
         .order_by(work_date_expr.asc(), Employee.code.asc())
         .all()
     )
+
+
+def _build_exception_status_map(
+    db: Session,
+    from_date: date | None,
+    to_date: date | None,
+    employee_id: int | None,
+    group_id: int | None,
+) -> dict[tuple[int, date], str]:
+    q = db.query(
+        AttendanceException.employee_id,
+        AttendanceException.work_date,
+        AttendanceException.status,
+    ).join(Employee, Employee.id == AttendanceException.employee_id)
+
+    if employee_id:
+        q = q.filter(AttendanceException.employee_id == employee_id)
+    if group_id:
+        q = q.filter(Employee.group_id == group_id)
+    if from_date:
+        q = q.filter(AttendanceException.work_date >= from_date)
+    if to_date:
+        q = q.filter(AttendanceException.work_date <= to_date)
+
+    status_map: dict[tuple[int, date], str] = {}
+    for row in q.all():
+        key = (row.employee_id, row.work_date)
+        current = status_map.get(key)
+        if current is None or current != "OPEN":
+            status_map[key] = row.status
+    return status_map
 
 
 def _to_excel_date(value: date | datetime | str | None) -> str | None:
@@ -166,7 +197,6 @@ def _to_excel_datetime(value: datetime | str | None) -> str | None:
         value = parsed
 
     if value.tzinfo is None:
-        # Defensive: if DB driver returns naive datetime, treat it as UTC.
         value = value.replace(tzinfo=UTC_TZ)
 
     return value.astimezone(VN_TZ).isoformat(sep=" ", timespec="seconds")
@@ -199,6 +229,8 @@ def export_attendance_report_excel(
     if not rows and not include_empty:
         raise HTTPException(status_code=404, detail="No attendance data for selected filters")
 
+    exception_status_map = _build_exception_status_map(db, from_date, to_date, employee_id, group_id)
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Attendance"
@@ -211,7 +243,6 @@ def export_attendance_report_excel(
         "group_name",
         "matched_geofence",
         "geofence_source",
-        "fallback_reason",
         "checkin_time",
         "checkout_time",
         "checkin_status",
@@ -219,6 +250,10 @@ def export_attendance_report_excel(
         "out_of_range",
         "avg_distance_m",
         "max_distance_m",
+        "regular_minutes",
+        "overtime_minutes",
+        "overtime_cross_day",
+        "exception_status",
     ]
     ws.append(headers)
 
@@ -236,6 +271,17 @@ def export_attendance_report_excel(
         matched_geofence = row.checkin_matched_geofence or row.checkout_matched_geofence
         geofence_source = _rank_to_geofence_source(row.geofence_source_rank)
 
+        shift_start = row.shift_start or time(8, 0)
+        shift_end = row.shift_end or time(17, 0)
+        regular_minutes, overtime_minutes, overtime_cross_day = split_regular_overtime_minutes(
+            row.work_date,
+            row.checkin_time,
+            row.checkout_time,
+            shift_start,
+            shift_end,
+        )
+        exception_status = exception_status_map.get((row.employee_id, row.work_date))
+
         ws.append(
             [
                 _to_excel_date(row.work_date),
@@ -245,7 +291,6 @@ def export_attendance_report_excel(
                 row.group_name,
                 matched_geofence,
                 geofence_source,
-                row.fallback_reason,
                 _to_excel_datetime(row.checkin_time),
                 _to_excel_datetime(row.checkout_time),
                 checkin_status,
@@ -253,11 +298,15 @@ def export_attendance_report_excel(
                 range_status_text,
                 float(row.avg_distance_m) if row.avg_distance_m is not None else None,
                 float(row.max_distance_m) if row.max_distance_m is not None else None,
+                regular_minutes,
+                overtime_minutes,
+                "YES" if overtime_cross_day else "NO",
+                exception_status,
             ]
         )
 
         current_row_idx = ws.max_row
-        range_cell = ws.cell(row=current_row_idx, column=13)
+        range_cell = ws.cell(row=current_row_idx, column=12)
         range_cell.fill = fill_warn if out_of_range_value else fill_ok
 
     ws.auto_filter.ref = ws.dimensions
@@ -292,7 +341,6 @@ def export_attendance_report_excel(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers=headers_response,
     )
-
 
 
 @router.get("/attendance-exceptions", response_model=list[AttendanceExceptionReportResponse])
@@ -372,3 +420,5 @@ def list_attendance_exceptions(
         )
         for row in rows
     ]
+
+

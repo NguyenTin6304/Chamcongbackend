@@ -1,4 +1,4 @@
-﻿from datetime import time
+﻿from datetime import datetime, time
 
 from pydantic import AliasChoices, BaseModel, Field, field_serializer, field_validator
 
@@ -11,6 +11,7 @@ class RuleResponse(BaseModel):
     grace_minutes: int
     end_time: time
     checkout_grace_minutes: int
+    cross_day_cutoff_minutes: int
 
     @field_serializer("start_time")
     def serialize_start_time(self, value: time) -> str:
@@ -19,6 +20,42 @@ class RuleResponse(BaseModel):
     @field_serializer("end_time")
     def serialize_end_time(self, value: time) -> str:
         return value.strftime("%H:%M")
+
+
+def _normalize_time_value(value):
+    if value is None:
+        return None
+
+    if isinstance(value, time):
+        # DB Time columns are timezone-naive. Drop tz if provided.
+        return value.replace(tzinfo=None)
+
+    if isinstance(value, datetime):
+        return value.timetz().replace(tzinfo=None)
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+
+        # Accept HH:MM
+        if len(raw) == 5 and raw[2] == ":":
+            raw = f"{raw}:00"
+
+        try:
+            parsed = time.fromisoformat(raw)
+            return parsed.replace(tzinfo=None)
+        except ValueError:
+            pass
+
+        # Accept full datetime string and extract time part.
+        try:
+            parsed_dt = datetime.fromisoformat(raw)
+            return parsed_dt.timetz().replace(tzinfo=None)
+        except ValueError:
+            return value
+
+    return value
 
 
 class RuleUpdateRequest(BaseModel):
@@ -48,31 +85,19 @@ class RuleUpdateRequest(BaseModel):
         ge=0,
         le=240,
     )
+    cross_day_cutoff_minutes: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("cross_day_cutoff_minutes", "cutoff_minutes", "cross_day_cutoff"),
+        ge=0,
+        le=720,
+    )
 
     @field_validator("start_time", mode="before")
     @classmethod
     def normalize_start_time(cls, value):
-        if value is None or isinstance(value, time):
-            return value
-        if isinstance(value, str):
-            raw = value.strip()
-            try:
-                return time.fromisoformat(raw)
-            except ValueError:
-                if len(raw) == 5:
-                    return time.fromisoformat(f"{raw}:00")
-        return value
+        return _normalize_time_value(value)
 
     @field_validator("end_time", mode="before")
     @classmethod
     def normalize_end_time(cls, value):
-        if value is None or isinstance(value, time):
-            return value
-        if isinstance(value, str):
-            raw = value.strip()
-            try:
-                return time.fromisoformat(raw)
-            except ValueError:
-                if len(raw) == 5:
-                    return time.fromisoformat(f"{raw}:00")
-        return value
+        return _normalize_time_value(value)

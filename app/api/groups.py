@@ -49,6 +49,7 @@ def create_group(
         grace_minutes=payload.grace_minutes,
         end_time=payload.end_time,
         checkout_grace_minutes=payload.checkout_grace_minutes,
+        cross_day_cutoff_minutes=payload.cross_day_cutoff_minutes,
     )
     try:
         db.add(group)
@@ -95,6 +96,8 @@ def update_group(
         group.end_time = payload.end_time
     if "checkout_grace_minutes" in payload.model_fields_set:
         group.checkout_grace_minutes = payload.checkout_grace_minutes
+    if "cross_day_cutoff_minutes" in payload.model_fields_set:
+        group.cross_day_cutoff_minutes = payload.cross_day_cutoff_minutes
 
     try:
         db.commit()
@@ -215,5 +218,3 @@ def delete_group_geofence(
     db.delete(geofence)
     db.commit()
     return {"ok": True, "deleted_id": geofence_id}
-
-

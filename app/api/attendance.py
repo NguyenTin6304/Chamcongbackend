@@ -1,4 +1,4 @@
-﻿from datetime import date, datetime, time, timedelta, timezone
+﻿from datetime import date, datetime, time, timezone
 from typing import NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -8,14 +8,17 @@ from sqlalchemy.orm import Session
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_admin
 from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, User
-from app.schemas.attendance import (
-    AttendanceDailyReportResponse,
-    AttendanceLogResponse,
-    AttendanceStatusResponse,
-    CheckActionResponse,
-    LocationRequest,
+from app.schemas.attendance import AttendanceDailyReportResponse, AttendanceLogResponse, AttendanceStatusResponse, CheckActionResponse, LocationRequest
+from app.services.attendance_time import (
+    DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
+    VN_TZ,
+    classify_checkin_status,
+    classify_checkout_status,
+    compute_work_date,
+    split_regular_overtime_minutes,
+    to_vn_time,
+    work_date_cutoff_utc,
 )
-from app.services.attendance_time import VN_TZ, classify_checkin_status, classify_checkout_status, to_vn_time
 from app.services.geo import haversine_m
 
 router = APIRouter(prefix="/attendance", tags=["attendance"])
@@ -33,15 +36,9 @@ class _EffectiveTimeRule(NamedTuple):
     grace_minutes: int
     end_time: time
     checkout_grace_minutes: int
-
-
-class _DayLogsState(NamedTuple):
-    day_start_utc: datetime
-    day_end_utc: datetime
-    work_date: date
-    has_in: bool
-    has_out: bool
-    latest_today_log: AttendanceLog | None
+    cutoff_minutes: int
+    source: str
+    fallback_reason: str | None
 
 
 def _find_employee_for_user(db: Session, user: User) -> Employee | None:
@@ -116,36 +113,52 @@ def _get_effective_geofences(
 
 
 def _get_effective_time_rule(db: Session, emp: Employee, fallback_rule: CheckinRule) -> _EffectiveTimeRule:
+    system_cutoff_minutes = (fallback_rule.cross_day_cutoff_minutes if fallback_rule.cross_day_cutoff_minutes is not None else DEFAULT_CROSS_DAY_CUTOFF_MINUTES)
+
     if emp.group_id is not None:
-        group = db.query(Group).filter(Group.id == emp.group_id, Group.active.is_(True)).first()
-        if group:
+        group = db.query(Group).filter(Group.id == emp.group_id).first()
+        if group and group.active:
             return _EffectiveTimeRule(
                 start_time=group.start_time or fallback_rule.start_time,
-                grace_minutes=(
-                    group.grace_minutes
-                    if group.grace_minutes is not None
-                    else fallback_rule.grace_minutes
-                ),
+                grace_minutes=group.grace_minutes if group.grace_minutes is not None else fallback_rule.grace_minutes,
                 end_time=group.end_time or fallback_rule.end_time,
                 checkout_grace_minutes=(
                     group.checkout_grace_minutes
                     if group.checkout_grace_minutes is not None
                     else fallback_rule.checkout_grace_minutes
                 ),
+                cutoff_minutes=(
+                    group.cross_day_cutoff_minutes
+                    if group.cross_day_cutoff_minutes is not None
+                    else system_cutoff_minutes
+                ),
+                source='GROUP',
+                fallback_reason=None,
             )
+        return _EffectiveTimeRule(
+            start_time=fallback_rule.start_time,
+            grace_minutes=fallback_rule.grace_minutes,
+            end_time=fallback_rule.end_time,
+            checkout_grace_minutes=fallback_rule.checkout_grace_minutes,
+            cutoff_minutes=system_cutoff_minutes,
+            source='SYSTEM_FALLBACK',
+            fallback_reason='GROUP_INACTIVE_OR_NOT_FOUND',
+        )
 
     return _EffectiveTimeRule(
         start_time=fallback_rule.start_time,
         grace_minutes=fallback_rule.grace_minutes,
         end_time=fallback_rule.end_time,
         checkout_grace_minutes=fallback_rule.checkout_grace_minutes,
+        cutoff_minutes=system_cutoff_minutes,
+        source='SYSTEM_FALLBACK',
+        fallback_reason='EMPLOYEE_NOT_ASSIGNED_GROUP',
     )
 
 
 def _evaluate_range(lat: float, lng: float, geofences: list[_GeoPoint]) -> tuple[float, bool, int, str | None]:
     nearest_distance: float | None = None
     nearest_radius: int | None = None
-
     best_in_range_distance: float | None = None
     matched_geofence_name: str | None = None
 
@@ -176,91 +189,121 @@ def _last_log(db: Session, employee_id: int) -> AttendanceLog | None:
     )
 
 
-def _vn_work_date(value: datetime) -> date:
-    return to_vn_time(value).date()
-
-
-
-def _vn_day_bounds_utc(now_utc: datetime) -> tuple[datetime, datetime, date]:
-    vn_now = to_vn_time(now_utc)
-    day_start_vn = datetime.combine(vn_now.date(), time.min, tzinfo=VN_TZ)
-    day_end_vn = day_start_vn + timedelta(days=1)
-    return day_start_vn.astimezone(timezone.utc), day_end_vn.astimezone(timezone.utc), vn_now.date()
-
-
-def _get_day_logs_state(db: Session, employee_id: int, now_utc: datetime) -> _DayLogsState:
-    day_start_utc, day_end_utc, work_date = _vn_day_bounds_utc(now_utc)
-    day_logs = (
-        db.query(AttendanceLog)
-        .filter(
-            AttendanceLog.employee_id == employee_id,
-            AttendanceLog.time >= day_start_utc,
-            AttendanceLog.time < day_end_utc,
-        )
-        .order_by(AttendanceLog.time.desc())
-        .all()
-    )
-    has_in = any(log.type == "IN" for log in day_logs)
-    has_out = any(log.type == "OUT" for log in day_logs)
-    latest_today_log = day_logs[0] if day_logs else None
-    return _DayLogsState(
-        day_start_utc=day_start_utc,
-        day_end_utc=day_end_utc,
-        work_date=work_date,
-        has_in=has_in,
-        has_out=has_out,
-        latest_today_log=latest_today_log,
-    )
-
-
-def _find_open_in_before_day(db: Session, employee_id: int, day_start_utc: datetime) -> AttendanceLog | None:
-    last_before_day = (
-        db.query(AttendanceLog)
-        .filter(
-            AttendanceLog.employee_id == employee_id,
-            AttendanceLog.time < day_start_utc,
-        )
-        .order_by(AttendanceLog.time.desc())
-        .first()
-    )
-    if last_before_day and last_before_day.type == "IN":
-        return last_before_day
+def _get_open_session_checkin(db: Session, employee_id: int) -> AttendanceLog | None:
+    last = _last_log(db, employee_id)
+    if last and last.type == "IN":
+        return last
     return None
-
-def _is_cross_day_open_in(last: AttendanceLog, now_utc: datetime) -> bool:
-    if last.type != "IN":
-        return False
-    return _vn_work_date(last.time) < _vn_work_date(now_utc)
 
 
 def _format_vn_date(value: date) -> str:
     return value.strftime("%d/%m")
 
 
-def _ensure_missed_checkout_exception(
-    db: Session,
-    emp: Employee,
-    source_checkin_log: AttendanceLog,
-) -> tuple[AttendanceException, bool]:
+def _get_log_work_date(log: AttendanceLog, cutoff_minutes: int) -> date:
+    if log.work_date is not None:
+        return log.work_date
+    return compute_work_date(log.time, cutoff_minutes)
+
+
+def _ensure_auto_closed_exception(db: Session, emp: Employee, source_checkin_log: AttendanceLog, work_date: date) -> None:
     existing = (
         db.query(AttendanceException)
         .filter(AttendanceException.source_checkin_log_id == source_checkin_log.id)
         .first()
     )
-    if existing:
-        return existing, False
 
-    exception = AttendanceException(
+    if existing is None:
+        db.add(
+            AttendanceException(
+                employee_id=emp.id,
+                source_checkin_log_id=source_checkin_log.id,
+                exception_type="AUTO_CLOSED",
+                work_date=work_date,
+                status="OPEN",
+                note="System auto closed session at cross-day cutoff",
+            )
+        )
+        return
+
+    existing.exception_type = "AUTO_CLOSED"
+    existing.work_date = work_date
+    existing.status = "OPEN"
+    existing.note = "System auto closed session at cross-day cutoff"
+
+
+def _auto_close_open_session_if_past_cutoff(
+    db: Session,
+    emp: Employee,
+    open_checkin: AttendanceLog | None,
+    now_utc: datetime,
+) -> date | None:
+    if open_checkin is None:
+        return None
+
+    cutoff_minutes = open_checkin.snapshot_cutoff_minutes or DEFAULT_CROSS_DAY_CUTOFF_MINUTES
+    work_date = _get_log_work_date(open_checkin, cutoff_minutes)
+    cutoff_utc = work_date_cutoff_utc(work_date, cutoff_minutes)
+
+    if now_utc < cutoff_utc:
+        return None
+
+    out_log = AttendanceLog(
         employee_id=emp.id,
-        source_checkin_log_id=source_checkin_log.id,
-        exception_type="MISSED_CHECKOUT",
-        work_date=_vn_work_date(source_checkin_log.time),
-        status="OPEN",
-        note="Detected cross-day open check-in",
+        type="OUT",
+        time=cutoff_utc,
+        work_date=work_date,
+        lat=open_checkin.lat,
+        lng=open_checkin.lng,
+        distance_m=open_checkin.distance_m,
+        is_out_of_range=open_checkin.is_out_of_range,
+        checkout_status=classify_checkout_status(
+            cutoff_utc,
+            open_checkin.snapshot_end_time or time(17, 0),
+            open_checkin.snapshot_checkout_grace_minutes or 0,
+        ),
+        matched_geofence_name=open_checkin.matched_geofence_name,
+        geofence_source=open_checkin.geofence_source,
+        fallback_reason=open_checkin.fallback_reason,
+        snapshot_start_time=open_checkin.snapshot_start_time,
+        snapshot_end_time=open_checkin.snapshot_end_time,
+        snapshot_grace_minutes=open_checkin.snapshot_grace_minutes,
+        snapshot_checkout_grace_minutes=open_checkin.snapshot_checkout_grace_minutes,
+        snapshot_cutoff_minutes=cutoff_minutes,
+        time_rule_source=open_checkin.time_rule_source,
+        time_rule_fallback_reason=open_checkin.time_rule_fallback_reason,
+        address_text="AUTO_CLOSED_AT_CUTOFF",
     )
-    db.add(exception)
-    db.flush()
-    return exception, True
+    db.add(out_log)
+    _ensure_auto_closed_exception(db, emp, open_checkin, work_date)
+    db.commit()
+    return work_date
+
+
+def _has_checkin_for_work_date(db: Session, employee_id: int, work_date: date) -> bool:
+    return (
+        db.query(AttendanceLog.id)
+        .filter(
+            AttendanceLog.employee_id == employee_id,
+            AttendanceLog.work_date == work_date,
+            AttendanceLog.type == "IN",
+        )
+        .first()
+        is not None
+    )
+
+
+def _has_checkout_for_work_date(db: Session, employee_id: int, work_date: date) -> bool:
+    return (
+        db.query(AttendanceLog.id)
+        .filter(
+            AttendanceLog.employee_id == employee_id,
+            AttendanceLog.work_date == work_date,
+            AttendanceLog.type == "OUT",
+        )
+        .first()
+        is not None
+    )
 
 
 def _to_log_response(log: AttendanceLog) -> AttendanceLogResponse:
@@ -268,6 +311,7 @@ def _to_log_response(log: AttendanceLog) -> AttendanceLogResponse:
         id=log.id,
         type=log.type,
         time=log.time,
+        work_date=log.work_date,
         lat=log.lat,
         lng=log.lng,
         distance_m=log.distance_m,
@@ -275,6 +319,8 @@ def _to_log_response(log: AttendanceLog) -> AttendanceLogResponse:
         matched_geofence=log.matched_geofence_name,
         geofence_source=log.geofence_source,
         fallback_reason=log.fallback_reason,
+        time_rule_source=log.time_rule_source,
+        time_rule_fallback_reason=log.time_rule_fallback_reason,
         is_out_of_range=log.is_out_of_range,
         punctuality_status=log.punctuality_status,
         checkout_status=log.checkout_status,
@@ -295,6 +341,42 @@ def _rank_to_geofence_source(rank_value) -> str | None:
     return mapping.get(int(rank_value))
 
 
+def _attendance_work_date_expr(db: Session):
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        legacy_expr = func.date(func.timezone("Asia/Ho_Chi_Minh", AttendanceLog.time))
+    else:
+        legacy_expr = func.date(AttendanceLog.time)
+    return func.coalesce(AttendanceLog.work_date, legacy_expr)
+
+
+def _build_exception_status_map(
+    db: Session,
+    from_date: date | None,
+    to_date: date | None,
+    employee_id: int | None,
+) -> dict[tuple[int, date], str]:
+    q = db.query(
+        AttendanceException.employee_id,
+        AttendanceException.work_date,
+        AttendanceException.status,
+    )
+
+    if employee_id:
+        q = q.filter(AttendanceException.employee_id == employee_id)
+    if from_date:
+        q = q.filter(AttendanceException.work_date >= from_date)
+    if to_date:
+        q = q.filter(AttendanceException.work_date <= to_date)
+
+    status_map: dict[tuple[int, date], str] = {}
+    for row in q.all():
+        key = (row.employee_id, row.work_date)
+        current = status_map.get(key)
+        if current is None or current != "OPEN":
+            status_map[key] = row.status
+    return status_map
+
+
 @router.get("/status", response_model=AttendanceStatusResponse)
 def my_attendance_status(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     emp = _find_employee_for_user(db, user)
@@ -311,63 +393,46 @@ def my_attendance_status(db: Session = Depends(get_db), user: User = Depends(get
         )
 
     now_utc = datetime.now(timezone.utc)
-    day_state = _get_day_logs_state(db, emp.id, now_utc)
+    open_checkin = _get_open_session_checkin(db, emp.id)
+    auto_closed_work_date = _auto_close_open_session_if_past_cutoff(db, emp, open_checkin, now_utc)
 
-    if day_state.has_in and day_state.has_out:
-        return AttendanceStatusResponse(
-            employee_assigned=True,
-            employee_id=emp.id,
-            current_state="OUT",
-            last_action=day_state.latest_today_log.type if day_state.latest_today_log else None,
-            last_action_time=day_state.latest_today_log.time if day_state.latest_today_log else None,
-            can_checkin=False,
-            can_checkout=False,
-            message="Bạn đã hoàn thành ca hôm nay.",
-        )
+    if auto_closed_work_date is None:
+        open_checkin = _get_open_session_checkin(db, emp.id)
+        if open_checkin:
+            return AttendanceStatusResponse(
+                employee_assigned=True,
+                employee_id=emp.id,
+                current_state="IN",
+                last_action="IN",
+                last_action_time=open_checkin.time,
+                can_checkin=False,
+                can_checkout=True,
+                message=(
+                    f"Bạn đang trong phiên làm việc ngày công {_format_vn_date(_get_log_work_date(open_checkin, open_checkin.snapshot_cutoff_minutes or DEFAULT_CROSS_DAY_CUTOFF_MINUTES))}."
+                ),
+            )
 
-    if day_state.has_in and not day_state.has_out:
-        return AttendanceStatusResponse(
-            employee_assigned=True,
-            employee_id=emp.id,
-            current_state="IN",
-            last_action="IN",
-            last_action_time=day_state.latest_today_log.time if day_state.latest_today_log else None,
-            can_checkin=False,
-            can_checkout=True,
-            message="Bạn đang ở trạng thái check-in trong ca hôm nay.",
-        )
+    active_rule = _get_active_rule(db)
+    time_rule = _get_effective_time_rule(db, emp, active_rule)
+    current_work_date = compute_work_date(now_utc, time_rule.cutoff_minutes)
 
-    if not day_state.has_in and day_state.has_out:
-        return AttendanceStatusResponse(
-            employee_assigned=True,
-            employee_id=emp.id,
-            current_state="OUT",
-            last_action="OUT",
-            last_action_time=day_state.latest_today_log.time if day_state.latest_today_log else None,
-            can_checkin=False,
-            can_checkout=False,
-            message="Hôm nay bạn đã checkout, không thể thao tác thêm.",
-        )
-
-    open_cross_day_in = _find_open_in_before_day(db, emp.id, day_state.day_start_utc)
-    if open_cross_day_in:
-        exception, _ = _ensure_missed_checkout_exception(db, emp, open_cross_day_in)
-        db.commit()
-        warning_date = exception.work_date
-        return AttendanceStatusResponse(
-            employee_assigned=True,
-            employee_id=emp.id,
-            current_state="OUT",
-            last_action="IN",
-            last_action_time=open_cross_day_in.time,
-            can_checkin=True,
-            can_checkout=False,
-            message=f"Hôm trước quên checkout ({_format_vn_date(warning_date)}). Hôm nay bạn có thể check-in bình thường.",
-            warning_code="MISSED_CHECKOUT",
-            warning_date=warning_date,
-        )
-
+    completed_today = _has_checkout_for_work_date(db, emp.id, current_work_date)
     last = _last_log(db, emp.id)
+
+    if completed_today:
+        return AttendanceStatusResponse(
+            employee_assigned=True,
+            employee_id=emp.id,
+            current_state="OUT",
+            last_action=last.type if last else None,
+            last_action_time=last.time if last else None,
+            can_checkin=False,
+            can_checkout=False,
+            message="Bạn đã hoàn thành phiên làm việc cho ngày công hiện tại.",
+            warning_code="AUTO_CLOSED" if auto_closed_work_date else None,
+            warning_date=auto_closed_work_date,
+        )
+
     return AttendanceStatusResponse(
         employee_assigned=True,
         employee_id=emp.id,
@@ -376,7 +441,13 @@ def my_attendance_status(db: Session = Depends(get_db), user: User = Depends(get
         last_action_time=last.time if last else None,
         can_checkin=True,
         can_checkout=False,
-        message="Bạn chưa check-in trong ca hiện tại",
+        message=(
+            f"Bạn có thể check-in ngày công {_format_vn_date(current_work_date)}."
+            if auto_closed_work_date is None
+            else f"Hệ thống đã tự đóng phiên ngày {_format_vn_date(auto_closed_work_date)} do qua cutoff. Bạn có thể check-in phiên mới."
+        ),
+        warning_code="AUTO_CLOSED" if auto_closed_work_date else None,
+        warning_date=auto_closed_work_date,
     )
 
 
@@ -384,23 +455,22 @@ def my_attendance_status(db: Session = Depends(get_db), user: User = Depends(get
 def checkin(payload: LocationRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     emp = _get_employee_for_user(db, user)
     active_rule = _get_active_rule(db)
-    geofences, geofence_source, fallback_reason = _get_effective_geofences(db, emp, active_rule)
+    geofences, geofence_source, geofence_fallback_reason = _get_effective_geofences(db, emp, active_rule)
     using_fallback_rule = geofence_source == "SYSTEM_FALLBACK"
     time_rule = _get_effective_time_rule(db, emp, active_rule)
 
     checkin_at = datetime.now(timezone.utc)
-    day_state = _get_day_logs_state(db, emp.id, checkin_at)
 
-    if day_state.has_in and not day_state.has_out:
-        raise HTTPException(status_code=400, detail="Hôm nay bạn đã CHECK-IN. Hãy CHECK-OUT trước.")
-    if day_state.has_out:
-        raise HTTPException(status_code=400, detail="Bạn đã hoàn thành ca hôm nay. Không thể CHECK-IN lại.")
+    open_checkin = _get_open_session_checkin(db, emp.id)
+    auto_closed_work_date = _auto_close_open_session_if_past_cutoff(db, emp, open_checkin, checkin_at)
 
-    missed_checkout_warning_date: date | None = None
-    open_cross_day_in = _find_open_in_before_day(db, emp.id, day_state.day_start_utc)
-    if open_cross_day_in:
-        exception, _ = _ensure_missed_checkout_exception(db, emp, open_cross_day_in)
-        missed_checkout_warning_date = exception.work_date
+    open_checkin = _get_open_session_checkin(db, emp.id)
+    if open_checkin:
+        raise HTTPException(status_code=400, detail="Bạn đang có phiên IN chưa checkout. Hãy checkout trước.")
+
+    work_date = compute_work_date(checkin_at, time_rule.cutoff_minutes)
+    if _has_checkin_for_work_date(db, emp.id, work_date):
+        raise HTTPException(status_code=400, detail="Bạn đã có phiên chấm công cho ngày công này.")
 
     punctuality_status = classify_checkin_status(
         checkin_at,
@@ -418,6 +488,7 @@ def checkin(payload: LocationRequest, db: Session = Depends(get_db), user: User 
         employee_id=emp.id,
         type="IN",
         time=checkin_at,
+        work_date=work_date,
         lat=payload.lat,
         lng=payload.lng,
         distance_m=nearest_distance,
@@ -425,32 +496,39 @@ def checkin(payload: LocationRequest, db: Session = Depends(get_db), user: User 
         punctuality_status=punctuality_status,
         matched_geofence_name=matched_geofence_name,
         geofence_source=geofence_source,
-        fallback_reason=fallback_reason,
+        fallback_reason=geofence_fallback_reason,
+        snapshot_start_time=time_rule.start_time,
+        snapshot_end_time=time_rule.end_time,
+        snapshot_grace_minutes=time_rule.grace_minutes,
+        snapshot_checkout_grace_minutes=time_rule.checkout_grace_minutes,
+        snapshot_cutoff_minutes=time_rule.cutoff_minutes,
+        time_rule_source=time_rule.source,
+        time_rule_fallback_reason=time_rule.fallback_reason,
     )
 
     db.add(log)
     db.commit()
     db.refresh(log)
 
-    msg = f"Check-in thành công ({punctuality_status})."
+    msg = f"Check-in thành công ({punctuality_status}) cho ngày công {_format_vn_date(work_date)}."
     if out_of_range:
         msg = (
-            f"Cảnh báo: bạn đã ở ngoài vùng cho phép: ({nearest_distance:.1f}m > {nearest_radius}m). "
+            f"Cảnh báo: bạn đã ở ngoài vùng cho phép ({nearest_distance:.1f}m > {nearest_radius}m). "
             f"Trạng thái giờ vào: {punctuality_status}."
         )
     elif matched_geofence_name:
         msg = f"Check-in thành công ({punctuality_status}) tại geofence: {matched_geofence_name}."
     elif using_fallback_rule:
-        msg = f"Check-in thành công ({punctuality_status}) theo rule fallback hệ thống ({fallback_reason})."
+        msg = f"Check-in thành công ({punctuality_status}) theo rule fallback hệ thống ({geofence_fallback_reason})."
 
-    if missed_checkout_warning_date is not None:
-        msg = f"{msg} Lưu ý: hôm trước bạn quên checkout ({_format_vn_date(missed_checkout_warning_date)}), hệ thống đã ghi nhận ngoại lệ."
+    if auto_closed_work_date:
+        msg = f"{msg} Hệ thống đã tự đóng phiên cũ ngày {_format_vn_date(auto_closed_work_date)} do qua cutoff."
 
     return CheckActionResponse(
         log=_to_log_response(log),
         message=msg,
         geofence_source=geofence_source,
-        fallback_reason=fallback_reason,
+        fallback_reason=geofence_fallback_reason,
     )
 
 
@@ -458,32 +536,29 @@ def checkin(payload: LocationRequest, db: Session = Depends(get_db), user: User 
 def checkout(payload: LocationRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     emp = _get_employee_for_user(db, user)
     active_rule = _get_active_rule(db)
-    geofences, geofence_source, fallback_reason = _get_effective_geofences(db, emp, active_rule)
+    geofences, geofence_source, geofence_fallback_reason = _get_effective_geofences(db, emp, active_rule)
     using_fallback_rule = geofence_source == "SYSTEM_FALLBACK"
-    time_rule = _get_effective_time_rule(db, emp, active_rule)
 
     checkout_at = datetime.now(timezone.utc)
-    day_state = _get_day_logs_state(db, emp.id, checkout_at)
 
-    if day_state.has_out:
-        raise HTTPException(status_code=400, detail="Hôm nay bạn đã CHECK-OUT rồi.")
+    open_checkin = _get_open_session_checkin(db, emp.id)
+    auto_closed_work_date = _auto_close_open_session_if_past_cutoff(db, emp, open_checkin, checkout_at)
+    if auto_closed_work_date is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Phiên ngày {_format_vn_date(auto_closed_work_date)} đã bị auto-close do quá cutoff. Hãy check-in phiên mới.",
+        )
 
-    if not day_state.has_in:
-        open_cross_day_in = _find_open_in_before_day(db, emp.id, day_state.day_start_utc)
-        if open_cross_day_in:
-            exception, _ = _ensure_missed_checkout_exception(db, emp, open_cross_day_in)
-            db.commit()
-            raise HTTPException(
-                status_code=400,
-                detail=f"Bạn đã quên checkout ngày {_format_vn_date(exception.work_date)}. Hãy check-in ca mới.",
-            )
-        raise HTTPException(status_code=400, detail="Hôm nay bạn chưa CHECK-IN.")
+    open_checkin = _get_open_session_checkin(db, emp.id)
+    if not open_checkin:
+        raise HTTPException(status_code=400, detail="Không có phiên IN đang mở để checkout.")
 
-    checkout_status = classify_checkout_status(
-        checkout_at,
-        time_rule.end_time,
-        time_rule.checkout_grace_minutes,
-    )
+    shift_end = open_checkin.snapshot_end_time or active_rule.end_time
+    checkout_grace = open_checkin.snapshot_checkout_grace_minutes
+    if checkout_grace is None:
+        checkout_grace = active_rule.checkout_grace_minutes
+
+    checkout_status = classify_checkout_status(checkout_at, shift_end, checkout_grace)
 
     nearest_distance, out_of_range, nearest_radius, matched_geofence_name = _evaluate_range(
         payload.lat,
@@ -491,10 +566,13 @@ def checkout(payload: LocationRequest, db: Session = Depends(get_db), user: User
         geofences,
     )
 
+    work_date = _get_log_work_date(open_checkin, open_checkin.snapshot_cutoff_minutes or DEFAULT_CROSS_DAY_CUTOFF_MINUTES)
+
     log = AttendanceLog(
         employee_id=emp.id,
         type="OUT",
         time=checkout_at,
+        work_date=work_date,
         lat=payload.lat,
         lng=payload.lng,
         distance_m=nearest_distance,
@@ -502,29 +580,36 @@ def checkout(payload: LocationRequest, db: Session = Depends(get_db), user: User
         checkout_status=checkout_status,
         matched_geofence_name=matched_geofence_name,
         geofence_source=geofence_source,
-        fallback_reason=fallback_reason,
+        fallback_reason=geofence_fallback_reason,
+        snapshot_start_time=open_checkin.snapshot_start_time,
+        snapshot_end_time=open_checkin.snapshot_end_time,
+        snapshot_grace_minutes=open_checkin.snapshot_grace_minutes,
+        snapshot_checkout_grace_minutes=open_checkin.snapshot_checkout_grace_minutes,
+        snapshot_cutoff_minutes=open_checkin.snapshot_cutoff_minutes,
+        time_rule_source=open_checkin.time_rule_source,
+        time_rule_fallback_reason=open_checkin.time_rule_fallback_reason,
     )
 
     db.add(log)
     db.commit()
     db.refresh(log)
 
-    msg = f"Check-out thành công ({checkout_status})."
+    msg = f"Check-out thành công ({checkout_status}) cho ngày công {_format_vn_date(work_date)}."
     if out_of_range:
         msg = (
-            f"Cảnh báo: bạn đã ở ngoài vùng cho phép: ({nearest_distance:.1f}m > {nearest_radius}m). "
+            f"Cảnh báo: bạn đã ở ngoài vùng cho phép ({nearest_distance:.1f}m > {nearest_radius}m). "
             f"Trạng thái giờ về: {checkout_status}."
         )
     elif matched_geofence_name:
         msg = f"Check-out thành công ({checkout_status}) tại geofence: {matched_geofence_name}."
     elif using_fallback_rule:
-        msg = f"Check-out thành công ({checkout_status}) theo rule fallback hệ thống ({fallback_reason})."
+        msg = f"Check-out thành công ({checkout_status}) theo rule fallback hệ thống ({geofence_fallback_reason})."
 
     return CheckActionResponse(
         log=_to_log_response(log),
         message=msg,
         geofence_source=geofence_source,
-        fallback_reason=fallback_reason,
+        fallback_reason=geofence_fallback_reason,
     )
 
 
@@ -556,14 +641,10 @@ def daily_report_admin(
     db: Session = Depends(get_db),
     _=Depends(require_admin),
 ):
-    work_date_expr = func.date(AttendanceLog.time)
+    work_date_expr = _attendance_work_date_expr(db)
 
-    checkin_time_expr = func.min(
-        case((AttendanceLog.type == "IN", AttendanceLog.time), else_=None)
-    ).label("checkin_time")
-    checkout_time_expr = func.max(
-        case((AttendanceLog.type == "OUT", AttendanceLog.time), else_=None)
-    ).label("checkout_time")
+    checkin_time_expr = func.min(case((AttendanceLog.type == "IN", AttendanceLog.time), else_=None)).label("checkin_time")
+    checkout_time_expr = func.max(case((AttendanceLog.type == "OUT", AttendanceLog.time), else_=None)).label("checkout_time")
 
     punctuality_rank_expr = func.min(
         case(
@@ -616,10 +697,13 @@ def daily_report_admin(
     out_of_range_expr = func.bool_or(AttendanceLog.is_out_of_range).label("out_of_range")
     avg_distance_expr = func.avg(AttendanceLog.distance_m).label("avg_distance_m")
     max_distance_expr = func.max(AttendanceLog.distance_m).label("max_distance_m")
+    shift_start_expr = func.max(case((AttendanceLog.type == "IN", AttendanceLog.snapshot_start_time), else_=None)).label("shift_start")
+    shift_end_expr = func.max(case((AttendanceLog.type == "IN", AttendanceLog.snapshot_end_time), else_=None)).label("shift_end")
 
     q = (
         db.query(
             work_date_expr.label("work_date"),
+            Employee.id.label("employee_id"),
             Employee.code.label("employee_code"),
             Employee.full_name.label("full_name"),
             Group.code.label("group_code"),
@@ -635,6 +719,8 @@ def daily_report_admin(
             out_of_range_expr,
             avg_distance_expr,
             max_distance_expr,
+            shift_start_expr,
+            shift_end_expr,
         )
         .join(Employee, Employee.id == AttendanceLog.employee_id)
         .outerjoin(Group, Group.id == Employee.group_id)
@@ -648,31 +734,51 @@ def daily_report_admin(
         q = q.filter(work_date_expr <= to_date)
 
     rows = (
-        q.group_by(work_date_expr, Employee.code, Employee.full_name, Group.code, Group.name)
+        q.group_by(work_date_expr, Employee.id, Employee.code, Employee.full_name, Group.code, Group.name)
         .order_by(work_date_expr.desc(), Employee.code.asc())
         .all()
     )
 
-    return [
-        AttendanceDailyReportResponse(
-            date=row.work_date,
-            employee_code=row.employee_code,
-            full_name=row.full_name,
-            group_code=row.group_code,
-            group_name=row.group_name,
-            matched_geofence=row.checkin_matched_geofence or row.checkout_matched_geofence,
-            geofence_source=_rank_to_geofence_source(row.geofence_source_rank),
-            fallback_reason=row.fallback_reason,
-            checkin_time=row.checkin_time,
-            checkout_time=row.checkout_time,
-            punctuality_status=_rank_to_punctuality(row.punctuality_rank),
-            checkout_status=_rank_to_punctuality(row.checkout_rank),
-            out_of_range=bool(row.out_of_range) if row.out_of_range is not None else False,
-            avg_distance_m=float(row.avg_distance_m) if row.avg_distance_m is not None else None,
-            max_distance_m=float(row.max_distance_m) if row.max_distance_m is not None else None,
+    default_rule = _get_active_rule(db)
+    exception_status_map = _build_exception_status_map(db, from_date, to_date, employee_id)
+
+    response: list[AttendanceDailyReportResponse] = []
+    for row in rows:
+        shift_start = row.shift_start or default_rule.start_time
+        shift_end = row.shift_end or default_rule.end_time
+        regular_minutes, overtime_minutes, overtime_cross_day = split_regular_overtime_minutes(
+            row.work_date,
+            row.checkin_time,
+            row.checkout_time,
+            shift_start,
+            shift_end,
         )
-        for row in rows
-    ]
+
+        response.append(
+            AttendanceDailyReportResponse(
+                date=row.work_date,
+                employee_code=row.employee_code,
+                full_name=row.full_name,
+                group_code=row.group_code,
+                group_name=row.group_name,
+                matched_geofence=row.checkin_matched_geofence or row.checkout_matched_geofence,
+                geofence_source=_rank_to_geofence_source(row.geofence_source_rank),
+                fallback_reason=row.fallback_reason,
+                checkin_time=row.checkin_time,
+                checkout_time=row.checkout_time,
+                punctuality_status=_rank_to_punctuality(row.punctuality_rank),
+                checkout_status=_rank_to_punctuality(row.checkout_rank),
+                out_of_range=bool(row.out_of_range) if row.out_of_range is not None else False,
+                avg_distance_m=float(row.avg_distance_m) if row.avg_distance_m is not None else None,
+                max_distance_m=float(row.max_distance_m) if row.max_distance_m is not None else None,
+                regular_minutes=regular_minutes,
+                overtime_minutes=overtime_minutes,
+                overtime_cross_day=overtime_cross_day,
+                exception_status=exception_status_map.get((row.employee_id, row.work_date)),
+            )
+        )
+
+    return response
 
 
 @router.get("", response_model=list[AttendanceLogResponse])
@@ -694,5 +800,4 @@ def list_logs_admin(
 
     logs = q.order_by(AttendanceLog.time.desc()).all()
     return [_to_log_response(x) for x in logs]
-
 

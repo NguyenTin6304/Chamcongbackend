@@ -41,6 +41,8 @@ class Group(Base):
     grace_minutes = Column(Integer, nullable=True)
     end_time = Column(Time, nullable=True)
     checkout_grace_minutes = Column(Integer, nullable=True)
+    # Work-date cutoff in minutes from 00:00 VN (e.g. 240 = 04:00).
+    cross_day_cutoff_minutes = Column(Integer, nullable=True)
     active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -85,6 +87,8 @@ class CheckinRule(Base):
     end_time = Column(Time, nullable=False, default=time(17, 30))
     # Minutes allowed after end_time to still be ON_TIME for checkout.
     checkout_grace_minutes = Column(Integer, nullable=False, default=0)
+    # Fallback work-date cutoff in minutes from 00:00 VN.
+    cross_day_cutoff_minutes = Column(Integer, nullable=False, default=240)
     active = Column(Boolean, default=True, nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -96,6 +100,9 @@ class AttendanceLog(Base):
     employee_id = Column(Integer, ForeignKey("employees.id"), nullable=False)
     type = Column(String(10), nullable=False)  # IN/OUT
     time = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    # Business day based on VN timezone + cross-day cutoff.
+    work_date = Column(Date, nullable=True, index=True)
 
     lat = Column(Float, nullable=False)
     lng = Column(Float, nullable=False)
@@ -109,6 +116,16 @@ class AttendanceLog(Base):
     matched_geofence_name = Column(String(255), nullable=True)
     geofence_source = Column(String(20), nullable=True)
     fallback_reason = Column(String(100), nullable=True)
+
+    # Snapshot at check-in time to keep payroll calculation stable even if rules change later.
+    snapshot_start_time = Column(Time, nullable=True)
+    snapshot_end_time = Column(Time, nullable=True)
+    snapshot_grace_minutes = Column(Integer, nullable=True)
+    snapshot_checkout_grace_minutes = Column(Integer, nullable=True)
+    snapshot_cutoff_minutes = Column(Integer, nullable=True)
+    time_rule_source = Column(String(20), nullable=True)
+    time_rule_fallback_reason = Column(String(100), nullable=True)
+
     address_text = Column(Text, nullable=True)
 
 
