@@ -1,13 +1,13 @@
-# Cham Cong App (FastAPI + PostgreSQL)
+# ChÃ¢Ìm CÃ´ng App (FastAPI + PostgreSQL)
 
-## 1) Tong quan
+## 1) TÃ´Ì‰ng quan
 Backend cham cong theo GPS (geofence), co 2 nhom nguoi dung:
 - `USER`: check-in/check-out, xem lich su cua minh.
 - `ADMIN`: cau hinh rule vi tri, quan ly employee, xem report, export Excel.
 
 Trang thai hien tai: backend da san sang cho Flutter User MVP.
 
-## 2) Stack cong nghe
+## 2) Stack cÃ´ng nghÃªÌ£
 - FastAPI
 - SQLAlchemy ORM
 - PostgreSQL
@@ -323,28 +323,28 @@ Project frontend: `E:\CongtyGPIT\fluttertest\birdle`
 - `ios/Runner/Info.plist`
 
 ## 18) Group/Geofence rollout (2026-03-11)
-### 1. Nghi?p v? dã ch?t và dã áp d?ng
+### 1. Nghi?p v? dï¿½ ch?t vï¿½ dï¿½ ï¿½p d?ng
 - Employee thu?c 1 group (`employees.group_id`).
-- Group có nhi?u geofence (`group_geofences`).
-- Check-in/out h?p l? n?u n?m trong ít nh?t 1 geofence active c?a group.
-- N?u ngoài t?t c? geofence c?a group => `is_out_of_range=true`.
-- Fallback t?m th?i: n?u employee chua có group ho?c group chua có geofence active, backend dùng `rules/active` d? không v? app cu.
+- Group cï¿½ nhi?u geofence (`group_geofences`).
+- Check-in/out h?p l? n?u n?m trong ï¿½t nh?t 1 geofence active c?a group.
+- N?u ngoï¿½i t?t c? geofence c?a group => `is_out_of_range=true`.
+- Fallback t?m th?i: n?u employee chua cï¿½ group ho?c group chua cï¿½ geofence active, backend dï¿½ng `rules/active` d? khï¿½ng v? app cu.
 
-### 2. D? li?u dã thêm
+### 2. D? li?u dï¿½ thï¿½m
 - B?ng `groups`: `id`, `code`, `name`, `active`, `created_at`.
 - B?ng `group_geofences`: `group_id`, `name`, `latitude`, `longitude`, `radius_m`, `active`, `created_at`.
 - C?t `employees.group_id` (nullable, FK -> `groups.id`).
 
 ### 3. Migration + seed
 - Migration m?i: `e8b1c2d3f4a5_add_group_geofence_tables.py`.
-- Ðã `alembic upgrade head` thành công, current head: `e8b1c2d3f4a5`.
+- ï¿½ï¿½ `alembic upgrade head` thï¿½nh cï¿½ng, current head: `e8b1c2d3f4a5`.
 - Seed script c?p nh?t: `scripts/seed_dev_data.py`.
   - 1 admin + 2 user demo.
   - 2 group demo:
     - `Q1_OFFICE` v?i 2 geofence (`Cong chinh`, `Toa nha phu`).
     - `BT_WAREHOUSE` v?i 1 geofence (`Kho trung tam`).
-  - Employee du?c gán group tuong ?ng.
-  - V?n t?o active fallback rule cho tuong thích ngu?c.
+  - Employee du?c gï¿½n group tuong ?ng.
+  - V?n t?o active fallback rule cho tuong thï¿½ch ngu?c.
 
 ## 19) Group time-rule per group (2026-03-11)
 ### Muc tieu
