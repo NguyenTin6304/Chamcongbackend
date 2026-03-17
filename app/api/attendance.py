@@ -341,6 +341,27 @@ def _rank_to_geofence_source(rank_value) -> str | None:
     return mapping.get(int(rank_value))
 
 
+def _derive_daily_status(
+    checkin_time: datetime | None,
+    checkout_time: datetime | None,
+    checkin_rank,
+    checkout_rank,
+) -> tuple[str | None, str | None, str]:
+    checkin_status = _rank_to_punctuality(checkin_rank)
+    checkout_status = _rank_to_punctuality(checkout_rank)
+
+    if checkin_time is None and checkout_time is None:
+        return "NO_CHECKIN", "NO_CHECKOUT", "ABSENT"
+
+    if checkin_time is None:
+        return "NO_CHECKIN", checkout_status or "NO_CHECKOUT", "MISSING_CHECKIN_ANOMALY"
+
+    if checkout_time is None:
+        return checkin_status, "NO_CHECKOUT", "MISSED_CHECKOUT"
+
+    return checkin_status, checkout_status, "COMPLETE"
+
+
 def _attendance_work_date_expr(db: Session):
     if db.bind is not None and db.bind.dialect.name == "postgresql":
         legacy_expr = func.date(func.timezone("Asia/Ho_Chi_Minh", AttendanceLog.time))
@@ -744,6 +765,12 @@ def daily_report_admin(
 
     response: list[AttendanceDailyReportResponse] = []
     for row in rows:
+        checkin_status, checkout_status, attendance_state = _derive_daily_status(
+            row.checkin_time,
+            row.checkout_time,
+            row.punctuality_rank,
+            row.checkout_rank,
+        )
         shift_start = row.shift_start or default_rule.start_time
         shift_end = row.shift_end or default_rule.end_time
         regular_minutes, overtime_minutes, overtime_cross_day = split_regular_overtime_minutes(
@@ -767,7 +794,9 @@ def daily_report_admin(
                 checkin_time=row.checkin_time,
                 checkout_time=row.checkout_time,
                 punctuality_status=_rank_to_punctuality(row.punctuality_rank),
-                checkout_status=_rank_to_punctuality(row.checkout_rank),
+                checkin_status=checkin_status,
+                checkout_status=checkout_status,
+                attendance_state=attendance_state,
                 out_of_range=bool(row.out_of_range) if row.out_of_range is not None else False,
                 avg_distance_m=float(row.avg_distance_m) if row.avg_distance_m is not None else None,
                 max_distance_m=float(row.max_distance_m) if row.max_distance_m is not None else None,

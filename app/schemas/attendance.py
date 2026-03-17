@@ -4,6 +4,9 @@ from typing import Literal
 from pydantic import AliasChoices, BaseModel, Field
 
 PunctualityStatus = Literal["EARLY", "ON_TIME", "LATE"]
+CheckinStatus = Literal["EARLY", "ON_TIME", "LATE", "NO_CHECKIN"]
+CheckoutStatus = Literal["EARLY", "ON_TIME", "LATE", "NO_CHECKOUT"]
+AttendanceState = Literal["COMPLETE", "MISSED_CHECKOUT", "MISSING_CHECKIN_ANOMALY", "ABSENT"]
 GeofenceSource = Literal["GROUP", "SYSTEM_FALLBACK"]
 TimeRuleSource = Literal["GROUP", "SYSTEM_FALLBACK"]
 AttendanceExceptionType = Literal["MISSED_CHECKOUT", "AUTO_CLOSED"]
@@ -66,8 +69,11 @@ class AttendanceDailyReportResponse(BaseModel):
     fallback_reason: str | None = None
     checkin_time: datetime | None = None
     checkout_time: datetime | None = None
+    # Kept for backward compatibility with old clients.
     punctuality_status: PunctualityStatus | None = None
-    checkout_status: PunctualityStatus | None = None
+    checkin_status: CheckinStatus | None = None
+    checkout_status: CheckoutStatus | None = None
+    attendance_state: AttendanceState
     out_of_range: bool
     avg_distance_m: float | None = None
     max_distance_m: float | None = None
@@ -92,3 +98,4 @@ class AttendanceExceptionReportResponse(BaseModel):
     source_checkin_time: datetime | None = None
     created_at: datetime | None = None
     resolved_at: datetime | None = None
+

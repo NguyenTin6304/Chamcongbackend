@@ -34,6 +34,27 @@ def _rank_to_geofence_source(rank_value) -> str | None:
     return mapping.get(int(rank_value))
 
 
+def _derive_daily_status(
+    checkin_time: datetime | None,
+    checkout_time: datetime | None,
+    checkin_rank,
+    checkout_rank,
+) -> tuple[str | None, str | None, str]:
+    checkin_status = _rank_to_punctuality(checkin_rank)
+    checkout_status = _rank_to_punctuality(checkout_rank)
+
+    if checkin_time is None and checkout_time is None:
+        return "NO_CHECKIN", "NO_CHECKOUT", "ABSENT"
+
+    if checkin_time is None:
+        return "NO_CHECKIN", checkout_status or "NO_CHECKOUT", "MISSING_CHECKIN_ANOMALY"
+
+    if checkout_time is None:
+        return checkin_status, "NO_CHECKOUT", "MISSED_CHECKOUT"
+
+    return checkin_status, checkout_status, "COMPLETE"
+
+
 def _work_date_expr(db: Session):
     dialect = db.bind.dialect.name if db.bind is not None else ""
     if dialect == "postgresql":
@@ -247,6 +268,7 @@ def export_attendance_report_excel(
         "checkout_time",
         "checkin_status",
         "checkout_status",
+        "attendance_state",
         "out_of_range",
         "avg_distance_m",
         "max_distance_m",
@@ -266,8 +288,12 @@ def export_attendance_report_excel(
     for row in rows:
         out_of_range_value = bool(row.out_of_range) if row.out_of_range is not None else False
         range_status_text = "OUT_OF_RANGE" if out_of_range_value else "IN_RANGE"
-        checkin_status = _rank_to_punctuality(row.punctuality_rank)
-        checkout_status = _rank_to_punctuality(row.checkout_rank)
+        checkin_status, checkout_status, attendance_state = _derive_daily_status(
+            row.checkin_time,
+            row.checkout_time,
+            row.punctuality_rank,
+            row.checkout_rank,
+        )
         matched_geofence = row.checkin_matched_geofence or row.checkout_matched_geofence
         geofence_source = _rank_to_geofence_source(row.geofence_source_rank)
 
@@ -295,6 +321,7 @@ def export_attendance_report_excel(
                 _to_excel_datetime(row.checkout_time),
                 checkin_status,
                 checkout_status,
+                attendance_state,
                 range_status_text,
                 float(row.avg_distance_m) if row.avg_distance_m is not None else None,
                 float(row.max_distance_m) if row.max_distance_m is not None else None,
@@ -306,7 +333,7 @@ def export_attendance_report_excel(
         )
 
         current_row_idx = ws.max_row
-        range_cell = ws.cell(row=current_row_idx, column=12)
+        range_cell = ws.cell(row=current_row_idx, column=14)
         range_cell.fill = fill_warn if out_of_range_value else fill_ok
 
     ws.auto_filter.ref = ws.dimensions
@@ -420,5 +447,4 @@ def list_attendance_exceptions(
         )
         for row in rows
     ]
-
 
