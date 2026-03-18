@@ -5,8 +5,8 @@ from pydantic import AliasChoices, BaseModel, Field
 
 PunctualityStatus = Literal["EARLY", "ON_TIME", "LATE"]
 CheckinStatus = Literal["EARLY", "ON_TIME", "LATE", "NO_CHECKIN"]
-CheckoutStatus = Literal["EARLY", "ON_TIME", "LATE", "NO_CHECKOUT"]
-AttendanceState = Literal["COMPLETE", "MISSED_CHECKOUT", "MISSING_CHECKIN_ANOMALY", "ABSENT"]
+CheckoutStatus = Literal["EARLY", "ON_TIME", "LATE", "NO_CHECKOUT", "SYSTEM_AUTO", "MISSING_PUNCH"]
+AttendanceState = Literal["COMPLETE", "MISSED_CHECKOUT", "MISSING_CHECKIN_ANOMALY", "ABSENT", "PENDING_TIMESHEET"]
 GeofenceSource = Literal["GROUP", "SYSTEM_FALLBACK"]
 TimeRuleSource = Literal["GROUP", "SYSTEM_FALLBACK"]
 AttendanceExceptionType = Literal["MISSED_CHECKOUT", "AUTO_CLOSED"]
@@ -35,7 +35,7 @@ class AttendanceLogResponse(BaseModel):
     time_rule_fallback_reason: str | None = None
     is_out_of_range: bool
     punctuality_status: PunctualityStatus | None = None
-    checkout_status: PunctualityStatus | None = None
+    checkout_status: CheckoutStatus | None = None
 
 
 class CheckActionResponse(BaseModel):
@@ -79,6 +79,7 @@ class AttendanceDailyReportResponse(BaseModel):
     max_distance_m: float | None = None
     regular_minutes: int | None = None
     overtime_minutes: int | None = None
+    payable_overtime_minutes: int | None = None
     overtime_cross_day: bool | None = None
     exception_status: AttendanceExceptionStatus | None = None
 
@@ -96,6 +97,17 @@ class AttendanceExceptionReportResponse(BaseModel):
     note: str | None = None
     source_checkin_log_id: int
     source_checkin_time: datetime | None = None
+    actual_checkout_time: datetime | None = None
     created_at: datetime | None = None
     resolved_at: datetime | None = None
+    resolved_by: int | None = None
+    resolved_by_email: str | None = None
 
+
+class AttendanceExceptionResolveRequest(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)
+    actual_checkout_time: datetime | None = None
+
+
+class AttendanceExceptionReopenRequest(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)

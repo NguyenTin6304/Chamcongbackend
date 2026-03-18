@@ -32,7 +32,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 def _authenticate_user(db: Session, email: str, password: str) -> User:
     user = db.query(User).filter(User.email == email).first()
     if not user or not verify_password(password, user.password_hash):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sai mật khẩu hoặc email xin vui lòng thử lại")
     return user
 
 
@@ -80,7 +80,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
         return RegisterResponse(id=user.id, email=user.email, role=user.role)
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=400, detail="Email already exists")
+        raise HTTPException(status_code=400, detail="Email đã tồn tại hãy thử với email khác")
 
 
 @router.post("/login", response_model=TokenResponse)

@@ -139,5 +139,8 @@ class AttendanceException(Base):
     work_date = Column(Date, nullable=False)
     status = Column(String(20), nullable=False, default="OPEN")  # OPEN/RESOLVED
     note = Column(Text, nullable=True)
+    actual_checkout_time = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    resolved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     resolved_at = Column(DateTime(timezone=True), nullable=True)
+

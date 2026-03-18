@@ -257,11 +257,7 @@ def _auto_close_open_session_if_past_cutoff(
         lng=open_checkin.lng,
         distance_m=open_checkin.distance_m,
         is_out_of_range=open_checkin.is_out_of_range,
-        checkout_status=classify_checkout_status(
-            cutoff_utc,
-            open_checkin.snapshot_end_time or time(17, 0),
-            open_checkin.snapshot_checkout_grace_minutes or 0,
-        ),
+        checkout_status="SYSTEM_AUTO",
         matched_geofence_name=open_checkin.matched_geofence_name,
         geofence_source=open_checkin.geofence_source,
         fallback_reason=open_checkin.fallback_reason,
@@ -346,9 +342,13 @@ def _derive_daily_status(
     checkout_time: datetime | None,
     checkin_rank,
     checkout_rank,
+    checkout_raw_status: str | None = None,
 ) -> tuple[str | None, str | None, str]:
     checkin_status = _rank_to_punctuality(checkin_rank)
     checkout_status = _rank_to_punctuality(checkout_rank)
+
+    if checkout_raw_status in {"SYSTEM_AUTO", "MISSING_PUNCH"}:
+        checkout_status = checkout_raw_status
 
     if checkin_time is None and checkout_time is None:
         return "NO_CHECKIN", "NO_CHECKOUT", "ABSENT"
@@ -370,16 +370,17 @@ def _attendance_work_date_expr(db: Session):
     return func.coalesce(AttendanceLog.work_date, legacy_expr)
 
 
-def _build_exception_status_map(
+def _build_exception_map(
     db: Session,
     from_date: date | None,
     to_date: date | None,
     employee_id: int | None,
-) -> dict[tuple[int, date], str]:
+) -> dict[tuple[int, date], tuple[str, str]]:
     q = db.query(
         AttendanceException.employee_id,
         AttendanceException.work_date,
         AttendanceException.status,
+        AttendanceException.exception_type,
     )
 
     if employee_id:
@@ -389,13 +390,35 @@ def _build_exception_status_map(
     if to_date:
         q = q.filter(AttendanceException.work_date <= to_date)
 
-    status_map: dict[tuple[int, date], str] = {}
+    status_map: dict[tuple[int, date], tuple[str, str]] = {}
     for row in q.all():
         key = (row.employee_id, row.work_date)
         current = status_map.get(key)
-        if current is None or current != "OPEN":
-            status_map[key] = row.status
+        if current is None or current[0] != "OPEN":
+            status_map[key] = (row.status, row.exception_type)
     return status_map
+
+
+def _apply_exception_to_attendance_state(
+    attendance_state: str,
+    exception_status: str | None,
+    exception_type: str | None,
+) -> str:
+    if exception_status == "OPEN" and exception_type in {"AUTO_CLOSED", "MISSED_CHECKOUT"}:
+        return "PENDING_TIMESHEET"
+    return attendance_state
+
+
+def _compute_payable_overtime_minutes(
+    overtime_minutes: int | None,
+    exception_status: str | None,
+    exception_type: str | None,
+) -> int | None:
+    if overtime_minutes is None:
+        return None
+    if exception_status == "OPEN" and exception_type in {"AUTO_CLOSED", "MISSED_CHECKOUT"}:
+        return 0
+    return overtime_minutes
 
 
 @router.get("/status", response_model=AttendanceStatusResponse)
@@ -497,6 +520,7 @@ def checkin(payload: LocationRequest, db: Session = Depends(get_db), user: User 
         checkin_at,
         time_rule.start_time,
         time_rule.grace_minutes,
+        work_date=work_date,
     )
 
     nearest_distance, out_of_range, nearest_radius, matched_geofence_name = _evaluate_range(
@@ -579,15 +603,20 @@ def checkout(payload: LocationRequest, db: Session = Depends(get_db), user: User
     if checkout_grace is None:
         checkout_grace = active_rule.checkout_grace_minutes
 
-    checkout_status = classify_checkout_status(checkout_at, shift_end, checkout_grace)
+    work_date = _get_log_work_date(open_checkin, open_checkin.snapshot_cutoff_minutes or DEFAULT_CROSS_DAY_CUTOFF_MINUTES)
+
+    checkout_status = classify_checkout_status(
+        checkout_at,
+        shift_end,
+        checkout_grace,
+        work_date=work_date,
+    )
 
     nearest_distance, out_of_range, nearest_radius, matched_geofence_name = _evaluate_range(
         payload.lat,
         payload.lng,
         geofences,
     )
-
-    work_date = _get_log_work_date(open_checkin, open_checkin.snapshot_cutoff_minutes or DEFAULT_CROSS_DAY_CUTOFF_MINUTES)
 
     log = AttendanceLog(
         employee_id=emp.id,
@@ -697,6 +726,11 @@ def daily_report_admin(
         )
     ).label("checkout_rank")
 
+    checkout_raw_status_expr = func.max(
+        case((AttendanceLog.type == "OUT", AttendanceLog.checkout_status), else_=None)
+    ).label("checkout_raw_status")
+
+
     checkin_matched_geofence_expr = func.max(
         case((AttendanceLog.type == "IN", AttendanceLog.matched_geofence_name), else_=None)
     ).label("checkin_matched_geofence")
@@ -733,6 +767,7 @@ def daily_report_admin(
             checkout_time_expr,
             punctuality_rank_expr,
             checkout_rank_expr,
+            checkout_raw_status_expr,
             checkin_matched_geofence_expr,
             checkout_matched_geofence_expr,
             geofence_source_rank_expr,
@@ -761,7 +796,7 @@ def daily_report_admin(
     )
 
     default_rule = _get_active_rule(db)
-    exception_status_map = _build_exception_status_map(db, from_date, to_date, employee_id)
+    exception_status_map = _build_exception_map(db, from_date, to_date, employee_id)
 
     response: list[AttendanceDailyReportResponse] = []
     for row in rows:
@@ -770,6 +805,7 @@ def daily_report_admin(
             row.checkout_time,
             row.punctuality_rank,
             row.checkout_rank,
+            row.checkout_raw_status,
         )
         shift_start = row.shift_start or default_rule.start_time
         shift_end = row.shift_end or default_rule.end_time
@@ -779,6 +815,18 @@ def daily_report_admin(
             row.checkout_time,
             shift_start,
             shift_end,
+        )
+
+        exception_status, exception_type = exception_status_map.get((row.employee_id, row.work_date), (None, None))
+        attendance_state = _apply_exception_to_attendance_state(
+            attendance_state=attendance_state,
+            exception_status=exception_status,
+            exception_type=exception_type,
+        )
+        payable_overtime_minutes = _compute_payable_overtime_minutes(
+            overtime_minutes=overtime_minutes,
+            exception_status=exception_status,
+            exception_type=exception_type,
         )
 
         response.append(
@@ -802,8 +850,9 @@ def daily_report_admin(
                 max_distance_m=float(row.max_distance_m) if row.max_distance_m is not None else None,
                 regular_minutes=regular_minutes,
                 overtime_minutes=overtime_minutes,
+                payable_overtime_minutes=payable_overtime_minutes,
                 overtime_cross_day=overtime_cross_day,
-                exception_status=exception_status_map.get((row.employee_id, row.work_date)),
+                exception_status=exception_status,
             )
         )
 
@@ -829,4 +878,9 @@ def list_logs_admin(
 
     logs = q.order_by(AttendanceLog.time.desc()).all()
     return [_to_log_response(x) for x in logs]
+
+
+
+
+
 

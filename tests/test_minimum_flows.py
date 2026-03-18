@@ -683,6 +683,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
         self.assertEqual(row["date"], "2026-03-10")
         self.assertEqual(row["regular_minutes"], 540)
         self.assertEqual(row["overtime_minutes"], 570)
+        self.assertEqual(row["payable_overtime_minutes"], 570)
         self.assertTrue(row["overtime_cross_day"])
 
         _FixedDateTime.fixed_now = None
@@ -722,8 +723,117 @@ class MinimumFlowsTestCase(unittest.TestCase):
         rows = report_res.json()
         self.assertTrue(any(row["employee_code"] == "EM011" for row in rows))
 
+        daily_report_res = self.client.get(
+            "/attendance/report/daily?from_date=2026-03-10&to_date=2026-03-10",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        self.assertEqual(daily_report_res.status_code, 200, daily_report_res.text)
+        daily_rows = daily_report_res.json()
+        row = next(r for r in daily_rows if r["employee_code"] == "EM011")
+        self.assertEqual(row["exception_status"], "OPEN")
+        self.assertEqual(row["attendance_state"], "PENDING_TIMESHEET")
+        self.assertEqual(row["checkout_status"], "SYSTEM_AUTO")
+        self.assertGreater(row["overtime_minutes"], 0)
+        self.assertEqual(row["payable_overtime_minutes"], 0)
+
         _FixedDateTime.fixed_now = None
 
+    def test_resolve_and_reopen_exception_recalculates_minutes(self) -> None:
+        admin = self._create_user(email="admin_resolve@example.com", password="admin123", role="ADMIN")
+        user = self._create_user(email="resolve_user@example.com", password="user123", role="USER")
+
+        self._create_employee(code="EM013", full_name="Resolve User", user_id=user.id)
+        self._create_rule(
+            latitude=10.7769,
+            longitude=106.7009,
+            radius_m=300,
+            start_time=time(8, 0),
+            grace_minutes=30,
+            end_time=time(17, 0),
+            checkout_grace_minutes=0,
+        )
+
+        token = self._login("resolve_user@example.com", "user123")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 10, 1, 0, tzinfo=timezone.utc)  # 08:00 VN
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            in_res = self.client.post(
+                "/attendance/checkin",
+                headers=headers,
+                json={"lat": 10.7769, "lng": 106.7009},
+            )
+        self.assertEqual(in_res.status_code, 200, in_res.text)
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 10, 23, 30, tzinfo=timezone.utc)  # 06:30 VN next day > cutoff
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            status_res = self.client.get("/attendance/status", headers=headers)
+        self.assertEqual(status_res.status_code, 200, status_res.text)
+        self.assertEqual(status_res.json()["warning_code"], "AUTO_CLOSED")
+
+        admin_token = self._login("admin_resolve@example.com", "admin123")
+        admin_headers = {"Authorization": f"Bearer {admin_token}"}
+
+        exception_res = self.client.get(
+            "/reports/attendance-exceptions?from=2026-03-10&to=2026-03-10&exception_type=AUTO_CLOSED",
+            headers=admin_headers,
+        )
+        self.assertEqual(exception_res.status_code, 200, exception_res.text)
+        rows = [r for r in exception_res.json() if r["employee_code"] == "EM013"]
+        self.assertTrue(rows)
+        exception_id = rows[0]["id"]
+
+        resolve_res = self.client.patch(
+            f"/reports/attendance-exceptions/{exception_id}/resolve",
+            headers=admin_headers,
+            json={
+                "note": "Admin confirmed checkout time",
+                "actual_checkout_time": "2026-03-10T10:00:00+00:00",
+            },
+        )
+        self.assertEqual(resolve_res.status_code, 200, resolve_res.text)
+        resolved = resolve_res.json()
+        self.assertEqual(resolved["status"], "RESOLVED")
+        self.assertEqual(resolved["resolved_by"], admin.id)
+        self.assertIsNotNone(resolved["actual_checkout_time"])
+
+        daily_resolved = self.client.get(
+            "/attendance/report/daily?from_date=2026-03-10&to_date=2026-03-10",
+            headers=admin_headers,
+        )
+        self.assertEqual(daily_resolved.status_code, 200, daily_resolved.text)
+        resolved_row = next(r for r in daily_resolved.json() if r["employee_code"] == "EM013")
+        self.assertEqual(resolved_row["exception_status"], "RESOLVED")
+        self.assertEqual(resolved_row["attendance_state"], "COMPLETE")
+        self.assertEqual(resolved_row["checkout_status"], "ON_TIME")
+        self.assertEqual(resolved_row["regular_minutes"], 540)
+        self.assertEqual(resolved_row["overtime_minutes"], 0)
+        self.assertEqual(resolved_row["payable_overtime_minutes"], 0)
+
+        reopen_res = self.client.patch(
+            f"/reports/attendance-exceptions/{exception_id}/reopen",
+            headers=admin_headers,
+            json={"note": "Need re-check attendance evidence"},
+        )
+        self.assertEqual(reopen_res.status_code, 200, reopen_res.text)
+        reopened = reopen_res.json()
+        self.assertEqual(reopened["status"], "OPEN")
+        self.assertIsNone(reopened["resolved_by"])
+        self.assertIsNone(reopened["actual_checkout_time"])
+
+        daily_reopened = self.client.get(
+            "/attendance/report/daily?from_date=2026-03-10&to_date=2026-03-10",
+            headers=admin_headers,
+        )
+        self.assertEqual(daily_reopened.status_code, 200, daily_reopened.text)
+        reopened_row = next(r for r in daily_reopened.json() if r["employee_code"] == "EM013")
+        self.assertEqual(reopened_row["exception_status"], "OPEN")
+        self.assertEqual(reopened_row["attendance_state"], "PENDING_TIMESHEET")
+        self.assertEqual(reopened_row["checkout_status"], "SYSTEM_AUTO")
+        self.assertGreater(reopened_row["overtime_minutes"], 0)
+        self.assertEqual(reopened_row["payable_overtime_minutes"], 0)
+
+        _FixedDateTime.fixed_now = None
     def test_same_day_open_in_still_blocks_second_checkin(self) -> None:
         user = self._create_user(email="same_day_user@example.com", password="user123", role="USER")
         self._create_employee(code="EM012", full_name="Same Day User", user_id=user.id)
@@ -801,7 +911,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
         worksheet = workbook.active
 
         headers = [cell.value for cell in worksheet[1]]
-        for required_header in ("group_code", "group_name", "matched_geofence", "geofence_source"):
+        for required_header in ("group_code", "group_name", "matched_geofence", "geofence_source", "payable_overtime_minutes"):
             self.assertIn(required_header, headers)
 
         header_index = {name: idx + 1 for idx, name in enumerate(headers)}
@@ -816,7 +926,5 @@ class MinimumFlowsTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
 
 
