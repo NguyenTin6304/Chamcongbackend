@@ -1,6 +1,6 @@
 ﻿from datetime import time
 
-from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, Text, Time
+from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, Text, Time, UniqueConstraint
 from sqlalchemy.sql import func
 
 from app.core.db import Base
@@ -28,6 +28,17 @@ class RefreshToken(Base):
     expires_at = Column(DateTime(timezone=True), nullable=False)
     revoked_at = Column(DateTime(timezone=True), nullable=True)
     replaced_by_jti = Column(String(64), nullable=True)
+
+
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    token_hash = Column(String(128), unique=True, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class Group(Base):
@@ -95,6 +106,9 @@ class CheckinRule(Base):
 
 class AttendanceLog(Base):
     __tablename__ = "attendance_logs"
+    __table_args__ = (
+        UniqueConstraint("employee_id", "work_date", "type", name="uq_attendance_logs_employee_work_date_type"),
+    )
 
     id = Column(Integer, primary_key=True)
     employee_id = Column(Integer, ForeignKey("employees.id"), nullable=False)
@@ -143,4 +157,3 @@ class AttendanceException(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     resolved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     resolved_at = Column(DateTime(timezone=True), nullable=True)
-

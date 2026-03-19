@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_admin
+from app.core.policy import WARN_GEOFENCE_RADIUS_M
 from app.models import CheckinRule
 from app.schemas.rules import RuleResponse, RuleUpdateRequest
 
@@ -18,6 +19,12 @@ DEFAULT_CHECKOUT_GRACE_MINUTES = 0
 DEFAULT_CROSS_DAY_CUTOFF_MINUTES = 240
 
 
+def _radius_policy_warning(radius_m: int) -> str | None:
+    if radius_m > WARN_GEOFENCE_RADIUS_M:
+        return "RADIUS_ABOVE_POLICY_THRESHOLD"
+    return None
+
+
 def _to_rule_response(rule: CheckinRule) -> RuleResponse:
     return RuleResponse(
         latitude=rule.latitude,
@@ -28,6 +35,7 @@ def _to_rule_response(rule: CheckinRule) -> RuleResponse:
         end_time=rule.end_time,
         checkout_grace_minutes=rule.checkout_grace_minutes,
         cross_day_cutoff_minutes=rule.cross_day_cutoff_minutes,
+        radius_policy_warning=_radius_policy_warning(rule.radius_m),
     )
 
 

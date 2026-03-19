@@ -2,6 +2,8 @@
 
 from pydantic import BaseModel, Field, field_serializer, field_validator
 
+from app.core.policy import MAX_GEOFENCE_RADIUS_M, MIN_GEOFENCE_RADIUS_M
+
 
 class GroupCreateRequest(BaseModel):
     code: str = Field(min_length=1, max_length=50)
@@ -112,7 +114,7 @@ class GroupGeofenceCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     latitude: float = Field(ge=-90, le=90)
     longitude: float = Field(ge=-180, le=180)
-    radius_m: int = Field(gt=0)
+    radius_m: int = Field(ge=MIN_GEOFENCE_RADIUS_M, le=MAX_GEOFENCE_RADIUS_M)
     active: bool = True
 
 
@@ -120,7 +122,7 @@ class GroupGeofenceUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
-    radius_m: int | None = Field(default=None, gt=0)
+    radius_m: int | None = Field(default=None, ge=MIN_GEOFENCE_RADIUS_M, le=MAX_GEOFENCE_RADIUS_M)
     active: bool | None = None
 
 
@@ -132,6 +134,7 @@ class GroupGeofenceResponse(BaseModel):
     longitude: float
     radius_m: int
     active: bool
+    radius_policy_warning: str | None = None
 
     class Config:
         from_attributes = True

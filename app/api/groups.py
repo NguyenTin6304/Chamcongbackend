@@ -4,17 +4,37 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.core.deps import require_admin
+from app.core.policy import WARN_GEOFENCE_RADIUS_M
 from app.models import Employee, Group, GroupGeofence
 from app.schemas.groups import (
     GroupCreateRequest,
     GroupGeofenceCreateRequest,
     GroupGeofenceResponse,
-    GroupGeofenceUpdateRequest,
     GroupResponse,
+    GroupGeofenceUpdateRequest,
     GroupUpdateRequest,
 )
 
 router = APIRouter(prefix="/groups", tags=["groups"])
+
+
+def _radius_policy_warning(radius_m: int) -> str | None:
+    if radius_m > WARN_GEOFENCE_RADIUS_M:
+        return "RADIUS_ABOVE_POLICY_THRESHOLD"
+    return None
+
+
+def _to_geofence_response(geofence: GroupGeofence) -> GroupGeofenceResponse:
+    return GroupGeofenceResponse(
+        id=geofence.id,
+        group_id=geofence.group_id,
+        name=geofence.name,
+        latitude=geofence.latitude,
+        longitude=geofence.longitude,
+        radius_m=geofence.radius_m,
+        active=geofence.active,
+        radius_policy_warning=_radius_policy_warning(geofence.radius_m),
+    )
 
 
 def _get_group_or_404(db: Session, group_id: int) -> Group:
@@ -162,7 +182,7 @@ def create_group_geofence(
     db.add(geofence)
     db.commit()
     db.refresh(geofence)
-    return geofence
+    return _to_geofence_response(geofence)
 
 
 @router.get("/{group_id}/geofences", response_model=list[GroupGeofenceResponse])
@@ -178,7 +198,8 @@ def list_group_geofences(
     if active_only:
         query = query.filter(GroupGeofence.active.is_(True))
 
-    return query.order_by(GroupGeofence.id.asc()).all()
+    geofences = query.order_by(GroupGeofence.id.asc()).all()
+    return [_to_geofence_response(item) for item in geofences]
 
 
 @router.put("/{group_id}/geofences/{geofence_id}", response_model=GroupGeofenceResponse)
@@ -204,7 +225,7 @@ def update_group_geofence(
 
     db.commit()
     db.refresh(geofence)
-    return geofence
+    return _to_geofence_response(geofence)
 
 
 @router.delete("/{group_id}/geofences/{geofence_id}")

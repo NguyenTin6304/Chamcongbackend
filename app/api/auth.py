@@ -1,4 +1,5 @@
-﻿from datetime import datetime, timezone
+﻿import logging
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
@@ -18,15 +19,23 @@ from app.core.security import (
 )
 from app.models import RefreshToken, User
 from app.schemas.auth import (
+    ForgotPasswordRequest,
     LoginRequest,
+    MessageResponse,
     RefreshTokenRequest,
     RegisterRequest,
     RegisterResponse,
+    ResetPasswordRequest,
     TokenResponse,
     UserMeResponse,
 )
+from app.services.auth.password_reset_service import PasswordResetService
+from app.services.mail.factory import get_mail_sender
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
+
+GENERIC_FORGOT_PASSWORD_MESSAGE = "Nếu email tồn tại, hệ thống đã gửi hướng dẫn đặt lại mật khẩu."
 
 
 def _authenticate_user(db: Session, email: str, password: str) -> User:
@@ -89,6 +98,48 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     tokens = _issue_tokens(db, user, remember_me=payload.remember_me)
     db.commit()
     return tokens
+
+
+@router.post("/forgot-password", response_model=MessageResponse)
+def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    try:
+        service = PasswordResetService(db=db, mail_sender=get_mail_sender())
+        service.request_password_reset(payload.email)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Forgot password failed internally")
+
+    return MessageResponse(message=GENERIC_FORGOT_PASSWORD_MESSAGE)
+
+
+@router.post("/reset-password", response_model=MessageResponse)
+def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db)):
+    try:
+        service = PasswordResetService(db=db, mail_sender=get_mail_sender())
+        service.reset_password(payload.token, payload.new_password)
+        db.commit()
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "INVALID_RESET_TOKEN",
+                "message": str(exc),
+            },
+        )
+    except Exception:
+        db.rollback()
+        logger.exception("Reset password failed internally")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "code": "INTERNAL_SERVER_ERROR",
+                "message": "Không thể đặt lại mật khẩu lúc này",
+            },
+        )
+
+    return MessageResponse(message="Đặt lại mật khẩu thành công")
 
 
 @router.post("/login-form", response_model=TokenResponse, deprecated=True)
@@ -214,4 +265,3 @@ def logout_all(db: Session = Depends(get_db), current_user: User = Depends(get_c
 @router.get("/me", response_model=UserMeResponse)
 def me(current_user: User = Depends(get_current_user)):
     return UserMeResponse(id=current_user.id, email=current_user.email, role=current_user.role)
-

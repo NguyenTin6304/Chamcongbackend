@@ -2,6 +2,8 @@
 
 from pydantic import AliasChoices, BaseModel, Field, field_serializer, field_validator
 
+from app.core.policy import MAX_GEOFENCE_RADIUS_M, MIN_GEOFENCE_RADIUS_M, WARN_GEOFENCE_RADIUS_M
+
 
 class RuleResponse(BaseModel):
     latitude: float
@@ -12,6 +14,7 @@ class RuleResponse(BaseModel):
     end_time: time
     checkout_grace_minutes: int
     cross_day_cutoff_minutes: int
+    radius_policy_warning: str | None = None
 
     @field_serializer("start_time")
     def serialize_start_time(self, value: time) -> str:
@@ -62,7 +65,11 @@ class RuleUpdateRequest(BaseModel):
     # Accept both {latitude, longitude, radius_m} and {lat, lng, radius}
     latitude: float = Field(validation_alias=AliasChoices("latitude", "lat"), ge=-90, le=90)
     longitude: float = Field(validation_alias=AliasChoices("longitude", "lng"), ge=-180, le=180)
-    radius_m: int = Field(validation_alias=AliasChoices("radius_m", "radius"), gt=0)
+    radius_m: int = Field(
+        validation_alias=AliasChoices("radius_m", "radius"),
+        ge=MIN_GEOFENCE_RADIUS_M,
+        le=MAX_GEOFENCE_RADIUS_M,
+    )
 
     # Optional in update to keep backward compatibility for existing clients.
     start_time: time | None = Field(
@@ -101,3 +108,10 @@ class RuleUpdateRequest(BaseModel):
     @classmethod
     def normalize_end_time(cls, value):
         return _normalize_time_value(value)
+
+
+__all__ = [
+    "RuleResponse",
+    "RuleUpdateRequest",
+    "WARN_GEOFENCE_RADIUS_M",
+]

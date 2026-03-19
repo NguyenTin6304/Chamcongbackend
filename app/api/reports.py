@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, aliased
 
 from app.core.db import get_db
 from app.core.deps import require_admin
-from app.models import AttendanceException, AttendanceLog, Employee, Group, User
+from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, Group, User
 from app.schemas.attendance import AttendanceExceptionReopenRequest, AttendanceExceptionReportResponse, AttendanceExceptionResolveRequest
 from app.services.attendance_time import (
     DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
@@ -19,6 +19,11 @@ from app.services.attendance_time import (
     normalize_utc,
     split_regular_overtime_minutes,
     work_date_cutoff_utc,
+)
+from app.services.report_consistency import (
+    compute_distance_consistency_warning,
+    load_group_geofence_radius_maps,
+    resolve_reference_radius_m,
 )
 
 router = APIRouter(prefix="/reports", tags=["reports"])
@@ -147,6 +152,7 @@ def _fetch_daily_report_rows(
             Employee.id.label("employee_id"),
             Employee.code.label("employee_code"),
             Employee.full_name.label("full_name"),
+            Group.id.label("group_id"),
             Group.code.label("group_code"),
             Group.name.label("group_name"),
             checkin_time_expr,
@@ -177,7 +183,7 @@ def _fetch_daily_report_rows(
         q = q.filter(work_date_expr <= to_date)
 
     return (
-        q.group_by(work_date_expr, Employee.id, Employee.code, Employee.full_name, Group.code, Group.name)
+        q.group_by(work_date_expr, Employee.id, Employee.code, Employee.full_name, Group.id, Group.code, Group.name)
         .order_by(work_date_expr.asc(), Employee.code.asc())
         .all()
     )
@@ -333,6 +339,7 @@ def _build_exception_response(db: Session, exception_id: int) -> AttendanceExcep
             AttendanceException.employee_id.label("employee_id"),
             Employee.code.label("employee_code"),
             Employee.full_name.label("full_name"),
+            Group.id.label("group_id"),
             Group.code.label("group_code"),
             Group.name.label("group_name"),
             AttendanceException.work_date.label("work_date"),
@@ -431,6 +438,10 @@ def export_attendance_report_excel(
         raise HTTPException(status_code=404, detail="No attendance data for selected filters")
 
     exception_status_map = _build_exception_map(db, from_date, to_date, employee_id, group_id)
+    active_rule = db.query(CheckinRule).filter(CheckinRule.active.is_(True)).first()
+    fallback_radius_m = active_rule.radius_m if active_rule is not None else None
+    group_ids = {int(row.group_id) for row in rows if row.group_id is not None}
+    geofence_radius_map, group_max_radius_map = load_group_geofence_radius_maps(db, group_ids)
 
     wb = Workbook()
     ws = wb.active
@@ -452,6 +463,8 @@ def export_attendance_report_excel(
         "out_of_range",
         "avg_distance_m",
         "max_distance_m",
+        "radius_m",
+        "distance_consistency_warning",
         "regular_minutes",
         "overtime_minutes",
         "payable_overtime_minutes",
@@ -465,6 +478,7 @@ def export_attendance_report_excel(
 
     fill_ok = PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")
     fill_warn = PatternFill(start_color="FFEBEE", end_color="FFEBEE", fill_type="solid")
+    fill_audit = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
 
     for row in rows:
         out_of_range_value = bool(row.out_of_range) if row.out_of_range is not None else False
@@ -478,6 +492,22 @@ def export_attendance_report_excel(
         )
         matched_geofence = row.checkin_matched_geofence or row.checkout_matched_geofence
         geofence_source = _rank_to_geofence_source(row.geofence_source_rank)
+        avg_distance_m = float(row.avg_distance_m) if row.avg_distance_m is not None else None
+        max_distance_m = float(row.max_distance_m) if row.max_distance_m is not None else None
+        radius_m = resolve_reference_radius_m(
+            geofence_source=geofence_source,
+            matched_geofence=matched_geofence,
+            group_id=row.group_id,
+            fallback_radius_m=fallback_radius_m,
+            named_radius_map=geofence_radius_map,
+            max_radius_map=group_max_radius_map,
+        )
+        distance_consistency_warning = compute_distance_consistency_warning(
+            out_of_range=out_of_range_value,
+            avg_distance_m=avg_distance_m,
+            max_distance_m=max_distance_m,
+            radius_m=radius_m,
+        )
 
         shift_start = row.shift_start or time(8, 0)
         shift_end = row.shift_end or time(17, 0)
@@ -515,8 +545,10 @@ def export_attendance_report_excel(
                 checkout_status,
                 attendance_state,
                 range_status_text,
-                float(row.avg_distance_m) if row.avg_distance_m is not None else None,
-                float(row.max_distance_m) if row.max_distance_m is not None else None,
+                avg_distance_m,
+                max_distance_m,
+                radius_m,
+                distance_consistency_warning,
                 regular_minutes,
                 overtime_minutes,
                 payable_overtime_minutes,
@@ -529,6 +561,10 @@ def export_attendance_report_excel(
         out_of_range_col = headers.index("out_of_range") + 1
         range_cell = ws.cell(row=current_row_idx, column=out_of_range_col)
         range_cell.fill = fill_warn if out_of_range_value else fill_ok
+
+        if distance_consistency_warning:
+            warning_col = headers.index("distance_consistency_warning") + 1
+            ws.cell(row=current_row_idx, column=warning_col).fill = fill_audit
 
     ws.auto_filter.ref = ws.dimensions
     ws.freeze_panes = "A2"
@@ -594,6 +630,7 @@ def list_attendance_exceptions(
             AttendanceException.employee_id.label("employee_id"),
             Employee.code.label("employee_code"),
             Employee.full_name.label("full_name"),
+            Group.id.label("group_id"),
             Group.code.label("group_code"),
             Group.name.label("group_name"),
             AttendanceException.work_date.label("work_date"),
@@ -667,29 +704,23 @@ def resolve_attendance_exception(
     if source_checkin is None:
         raise HTTPException(status_code=400, detail="source check-in log not found")
 
-    existing_checkout_log = _find_checkout_log_for_exception(db, exception, source_checkin)
-    actual_checkout_utc: datetime | None = None
-    if payload.actual_checkout_time is not None:
-        actual_checkout_utc = normalize_utc(payload.actual_checkout_time)
-    elif exception.actual_checkout_time is not None:
-        actual_checkout_utc = normalize_utc(exception.actual_checkout_time)
+    if payload.actual_checkout_time is None:
+        if exception.exception_type == "AUTO_CLOSED":
+            raise HTTPException(status_code=400, detail="actual_checkout_time is required for AUTO_CLOSED")
+        raise HTTPException(status_code=400, detail="actual_checkout_time is required for MISSED_CHECKOUT")
 
-    if actual_checkout_utc is not None and actual_checkout_utc <= normalize_utc(source_checkin.time):
+    actual_checkout_utc = normalize_utc(payload.actual_checkout_time)
+    if actual_checkout_utc <= normalize_utc(source_checkin.time):
         raise HTTPException(status_code=400, detail="actual_checkout_time must be later than source check-in time")
 
-    if actual_checkout_utc is None and existing_checkout_log is None:
-        raise HTTPException(status_code=400, detail="actual_checkout_time is required when no checkout log exists")
-
-    if actual_checkout_utc is not None:
-        _upsert_checkout_log_from_resolution(db, exception, source_checkin, actual_checkout_utc)
+    _upsert_checkout_log_from_resolution(db, exception, source_checkin, actual_checkout_utc)
+    exception.actual_checkout_time = actual_checkout_utc
 
     exception.status = "RESOLVED"
     exception.resolved_by = admin_user.id
     exception.resolved_at = datetime.now(timezone.utc)
     if payload.note is not None:
         exception.note = payload.note
-    if actual_checkout_utc is not None:
-        exception.actual_checkout_time = actual_checkout_utc
 
     db.commit()
     return _build_exception_response(db, exception_id)
@@ -721,3 +752,14 @@ def reopen_attendance_exception(
 
     db.commit()
     return _build_exception_response(db, exception_id)
+
+
+
+
+
+
+
+
+
+
+

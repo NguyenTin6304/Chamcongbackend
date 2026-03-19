@@ -77,6 +77,8 @@ class AttendanceDailyReportResponse(BaseModel):
     out_of_range: bool
     avg_distance_m: float | None = None
     max_distance_m: float | None = None
+    radius_m: int | None = None
+    distance_consistency_warning: str | None = None
     regular_minutes: int | None = None
     overtime_minutes: int | None = None
     payable_overtime_minutes: int | None = None

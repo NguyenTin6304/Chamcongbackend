@@ -1,4 +1,5 @@
 ﻿import logging
+import threading
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
@@ -13,10 +14,15 @@ from app.api.reports import router as reports_router
 from app.api.rules import router as rules_router
 from app.api.users import router as users_router
 from app.core.config import settings
-from app.core.db import Base, engine
+from app.core.db import Base, SessionLocal, engine
+from app.services.auth.password_reset_service import cleanup_password_reset_tokens
 
 app = FastAPI(title="Attendance API")
 logger = logging.getLogger(__name__)
+
+_cleanup_stop_event = threading.Event()
+_cleanup_thread: threading.Thread | None = None
+
 
 # Allow local Flutter web (localhost with any port) and Vercel deployments.
 # Avoid using "*" with credentials because browsers can block those requests.
@@ -33,11 +39,50 @@ app.add_middleware(
 )
 
 
+def _password_reset_cleanup_loop() -> None:
+    interval_hours = max(1, int(settings.PASSWORD_RESET_CLEANUP_INTERVAL_HOURS))
+    interval_seconds = interval_hours * 3600
+    retention_days = max(0, int(settings.PASSWORD_RESET_USED_TOKEN_RETENTION_DAYS))
+
+    while not _cleanup_stop_event.is_set():
+        try:
+            with SessionLocal() as db:
+                deleted = cleanup_password_reset_tokens(db, used_retention_days=retention_days)
+                db.commit()
+            if deleted > 0:
+                logger.info("password_reset_tokens cleanup deleted %s rows", deleted)
+        except Exception:  # pragma: no cover - defensive background loop
+            logger.exception("password_reset_tokens cleanup failed")
+
+        if _cleanup_stop_event.wait(interval_seconds):
+            break
+
+
 @app.on_event("startup")
 def startup_create_tables() -> None:
     # Keep Alembic as source of truth. Enable only for quick local demos.
     if settings.AUTO_CREATE_TABLES:
         Base.metadata.create_all(bind=engine)
+
+    if settings.PASSWORD_RESET_CLEANUP_ENABLED:
+        global _cleanup_thread
+        if _cleanup_thread is None or not _cleanup_thread.is_alive():
+            _cleanup_stop_event.clear()
+            _cleanup_thread = threading.Thread(
+                target=_password_reset_cleanup_loop,
+                name="password-reset-cleanup",
+                daemon=True,
+            )
+            _cleanup_thread.start()
+
+
+@app.on_event("shutdown")
+def shutdown_background_jobs() -> None:
+    global _cleanup_thread
+    _cleanup_stop_event.set()
+    if _cleanup_thread and _cleanup_thread.is_alive():
+        _cleanup_thread.join(timeout=3)
+    _cleanup_thread = None
 
 
 @app.get("/health")

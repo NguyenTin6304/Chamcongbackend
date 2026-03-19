@@ -1,8 +1,9 @@
 ﻿import os
 import sqlite3
+import threading
 import unittest
 from unittest.mock import patch
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -13,12 +14,16 @@ os.environ.setdefault("ACCESS_TOKEN_EXPIRE_MINUTES", "60")
 
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
+from fastapi import HTTPException
 from sqlalchemy import event
 
 from app.core.db import Base, SessionLocal, engine
-from app.core.security import hash_password
+from app.core.security import hash_password, hash_token
 from app.main import app
-from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, RefreshToken, User
+from app.api import attendance as attendance_api
+from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, PasswordResetToken, RefreshToken, User
+from app.schemas.attendance import LocationRequest
+from app.services.auth.password_reset_service import PasswordResetService, cleanup_password_reset_tokens
 
 
 class _BoolOr:
@@ -43,6 +48,13 @@ class _FixedDateTime(datetime):
         if tz is None:
             return cls.fixed_now.replace(tzinfo=None)
         return cls.fixed_now.astimezone(tz)
+
+class _SpyMailSender:
+    def __init__(self) -> None:
+        self.sent = []
+
+    def send_reset_password(self, payload) -> None:
+        self.sent.append(payload)
 
 
 @event.listens_for(engine, "connect")
@@ -74,6 +86,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
             db.query(AttendanceException).delete()
             db.query(AttendanceLog).delete()
             db.query(RefreshToken).delete()
+            db.query(PasswordResetToken).delete()
             db.query(Employee).delete()
             db.query(GroupGeofence).delete()
             db.query(Group).delete()
@@ -196,6 +209,20 @@ class MinimumFlowsTestCase(unittest.TestCase):
     def _login(self, email: str, password: str) -> str:
         return self._login_tokens(email, password)["access_token"]
 
+    def _request_forgot_password(
+        self,
+        email: str,
+        raw_token: str = "known-reset-token",
+    ):
+        spy_mail = _SpyMailSender()
+        with patch("app.api.auth.get_mail_sender", return_value=spy_mail), patch(
+            "app.services.auth.password_reset_service.token_urlsafe",
+            return_value=raw_token,
+        ):
+            response = self.client.post("/auth/forgot-password", json={"email": email})
+        return response, spy_mail
+
+
     def test_register_login_flow(self) -> None:
         email = "flow_user@example.com"
         password = "user123"
@@ -272,6 +299,177 @@ class MinimumFlowsTestCase(unittest.TestCase):
             )
             self.assertEqual(active_count, 0)
 
+    def test_forgot_reset_password_happy_path(self) -> None:
+        email = "forgot_user@example.com"
+        old_password = "oldpass123"
+        new_password = "newpass456"
+        self._create_user(email=email, password=old_password, role="USER")
+
+        # Create a refresh token before reset to verify revoke-all behavior.
+        self._login_tokens(email, old_password, remember_me=True)
+
+        forgot_res, spy_mail = self._request_forgot_password(email=email, raw_token="happy-reset-token")
+        self.assertEqual(forgot_res.status_code, 200, forgot_res.text)
+        self.assertEqual(
+            forgot_res.json().get("message"),
+            "Nếu email tồn tại, hệ thống đã gửi hướng dẫn đặt lại mật khẩu.",
+        )
+        self.assertEqual(len(spy_mail.sent), 1)
+        self.assertIn("token=happy-reset-token", spy_mail.sent[0].reset_url)
+        self.assertEqual(spy_mail.sent[0].reset_token, "happy-reset-token")
+
+        with SessionLocal() as db:
+            user = db.query(User).filter(User.email == email).first()
+            self.assertIsNotNone(user)
+            token_row = db.query(PasswordResetToken).filter(PasswordResetToken.user_id == user.id).first()
+            self.assertIsNotNone(token_row)
+            self.assertEqual(token_row.token_hash, hash_token("happy-reset-token"))
+            self.assertIsNone(token_row.used_at)
+
+        reset_res = self.client.post(
+            "/auth/reset-password",
+            json={"token": "happy-reset-token", "new_password": new_password},
+        )
+        self.assertEqual(reset_res.status_code, 200, reset_res.text)
+
+        old_login = self.client.post(
+            "/auth/login",
+            json={"email": email, "password": old_password, "remember_me": True},
+        )
+        self.assertEqual(old_login.status_code, 401, old_login.text)
+
+        new_login = self.client.post(
+            "/auth/login",
+            json={"email": email, "password": new_password, "remember_me": True},
+        )
+        self.assertEqual(new_login.status_code, 200, new_login.text)
+
+        with SessionLocal() as db:
+            user = db.query(User).filter(User.email == email).first()
+            self.assertIsNotNone(user)
+            token_row = db.query(PasswordResetToken).filter(PasswordResetToken.user_id == user.id).first()
+            self.assertIsNotNone(token_row)
+            self.assertIsNotNone(token_row.used_at)
+            active_refresh_count = (
+                db.query(RefreshToken)
+                .filter(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
+                .count()
+            )
+            self.assertEqual(active_refresh_count, 1)
+
+    def test_reset_password_rejects_expired_token(self) -> None:
+        email = "expired_reset@example.com"
+        self._create_user(email=email, password="oldpass123", role="USER")
+
+        self._request_forgot_password(email=email, raw_token="expired-reset-token")
+
+        with SessionLocal() as db:
+            user = db.query(User).filter(User.email == email).first()
+            self.assertIsNotNone(user)
+            token_row = db.query(PasswordResetToken).filter(PasswordResetToken.user_id == user.id).first()
+            self.assertIsNotNone(token_row)
+            token_row.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+            db.commit()
+
+        reset_res = self.client.post(
+            "/auth/reset-password",
+            json={"token": "expired-reset-token", "new_password": "newpass456"},
+        )
+        self.assertEqual(reset_res.status_code, 400, reset_res.text)
+        self.assertEqual(reset_res.json()["error"]["code"], "INVALID_RESET_TOKEN")
+
+    def test_reset_password_rejects_used_token(self) -> None:
+        email = "used_reset@example.com"
+        self._create_user(email=email, password="oldpass123", role="USER")
+
+        self._request_forgot_password(email=email, raw_token="used-reset-token")
+
+        with SessionLocal() as db:
+            user = db.query(User).filter(User.email == email).first()
+            self.assertIsNotNone(user)
+            token_row = db.query(PasswordResetToken).filter(PasswordResetToken.user_id == user.id).first()
+            self.assertIsNotNone(token_row)
+            token_row.used_at = datetime.now(timezone.utc)
+            db.commit()
+
+        reset_res = self.client.post(
+            "/auth/reset-password",
+            json={"token": "used-reset-token", "new_password": "newpass456"},
+        )
+        self.assertEqual(reset_res.status_code, 400, reset_res.text)
+        self.assertEqual(reset_res.json()["error"]["code"], "INVALID_RESET_TOKEN")
+
+    def test_reset_password_rejects_empty_token(self) -> None:
+        reset_res = self.client.post(
+            "/auth/reset-password",
+            json={"token": "   ", "new_password": "newpass456"},
+        )
+        self.assertEqual(reset_res.status_code, 400, reset_res.text)
+        self.assertEqual(reset_res.json()["error"]["code"], "INVALID_RESET_TOKEN")
+
+    def test_reset_password_rejects_malformed_link_token(self) -> None:
+        reset_res = self.client.post(
+            "/auth/reset-password",
+            json={
+                "token": "http://localhost:62601/#/reset-password?token=",
+                "new_password": "newpass456",
+            },
+        )
+        self.assertEqual(reset_res.status_code, 400, reset_res.text)
+        self.assertEqual(reset_res.json()["error"]["code"], "INVALID_RESET_TOKEN")
+
+    def test_password_reset_url_builder_handles_malformed_base(self) -> None:
+        with patch(
+            "app.services.auth.password_reset_service.settings.RESET_PASSWORD_URL_BASE",
+            "http://localhost:62601/?foo=1#/reset-password?token=",
+        ):
+            reset_url = PasswordResetService._build_reset_url("abc-token")
+
+        self.assertIn("#/reset-password?token=abc-token", reset_url)
+        self.assertNotIn("?token=#/reset-password", reset_url)
+        self.assertNotIn("token=&", reset_url)
+
+    def test_password_reset_cleanup_removes_expired_and_old_used_tokens(self) -> None:
+        user = self._create_user(email="cleanup_reset@example.com", password="oldpass123", role="USER")
+        now_utc = datetime(2026, 3, 19, 0, 0, tzinfo=timezone.utc)
+
+        with SessionLocal() as db:
+            db.add_all(
+                [
+                    PasswordResetToken(
+                        user_id=user.id,
+                        token_hash=hash_token("expired-token"),
+                        expires_at=now_utc - timedelta(minutes=5),
+                        used_at=None,
+                    ),
+                    PasswordResetToken(
+                        user_id=user.id,
+                        token_hash=hash_token("used-old-token"),
+                        expires_at=now_utc + timedelta(days=1),
+                        used_at=now_utc - timedelta(days=2),
+                    ),
+                    PasswordResetToken(
+                        user_id=user.id,
+                        token_hash=hash_token("active-token"),
+                        expires_at=now_utc + timedelta(days=1),
+                        used_at=None,
+                    ),
+                ]
+            )
+            db.commit()
+
+            deleted = cleanup_password_reset_tokens(
+                db,
+                now_utc=now_utc,
+                used_retention_days=1,
+            )
+            db.commit()
+            self.assertEqual(deleted, 2)
+
+            remaining_hashes = {row.token_hash for row in db.query(PasswordResetToken).all()}
+            self.assertEqual(remaining_hashes, {hash_token("active-token")})
+
+
     def test_set_rule_flow(self) -> None:
         self._create_user(email="admin@example.com", password="admin123", role="ADMIN")
         admin_token = self._login("admin@example.com", "admin123")
@@ -293,13 +491,53 @@ class MinimumFlowsTestCase(unittest.TestCase):
         self.assertEqual(put_res.json()["radius_m"], 250)
         self.assertEqual(put_res.json()["end_time"], "17:30")
         self.assertEqual(put_res.json()["checkout_grace_minutes"], 10)
+        self.assertIsNone(put_res.json().get("radius_policy_warning"))
+
+        warn_res = self.client.put(
+            "/rules/active",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            json={
+                "lat": 10.7769,
+                "lng": 106.7009,
+                "radius": 350,
+                "start_time": "08:00",
+                "grace_minutes": 30,
+                "end_time": "17:30",
+                "checkout_grace_minutes": 10,
+            },
+        )
+        self.assertEqual(warn_res.status_code, 200, warn_res.text)
+        self.assertEqual(warn_res.json()["radius_m"], 350)
+        self.assertEqual(
+            warn_res.json().get("radius_policy_warning"),
+            "RADIUS_ABOVE_POLICY_THRESHOLD",
+        )
+
+        invalid_res = self.client.put(
+            "/rules/active",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            json={
+                "lat": 10.7769,
+                "lng": 106.7009,
+                "radius": 10,
+                "start_time": "08:00",
+                "grace_minutes": 30,
+                "end_time": "17:30",
+                "checkout_grace_minutes": 10,
+            },
+        )
+        self.assertEqual(invalid_res.status_code, 422, invalid_res.text)
 
         get_res = self.client.get(
             "/rules/active",
             headers={"Authorization": f"Bearer {admin_token}"},
         )
         self.assertEqual(get_res.status_code, 200, get_res.text)
-        self.assertEqual(get_res.json()["radius_m"], 250)
+        self.assertEqual(get_res.json()["radius_m"], 350)
+        self.assertEqual(
+            get_res.json().get("radius_policy_warning"),
+            "RADIUS_ABOVE_POLICY_THRESHOLD",
+        )
 
     def test_group_time_rule_crud_flow(self) -> None:
         self._create_user(email="admin_group_time@example.com", password="admin123", role="ADMIN")
@@ -341,6 +579,65 @@ class MinimumFlowsTestCase(unittest.TestCase):
         self.assertIsNone(updated["start_time"])
         self.assertEqual(updated["grace_minutes"], 25)
         self.assertEqual(updated["checkout_grace_minutes"], 20)
+
+    def test_group_geofence_radius_guardrail_and_warning(self) -> None:
+        self._create_user(email="admin_geofence_policy@example.com", password="admin123", role="ADMIN")
+        admin_token = self._login("admin_geofence_policy@example.com", "admin123")
+        headers = {"Authorization": f"Bearer {admin_token}"}
+
+        create_group_res = self.client.post(
+            "/groups",
+            headers=headers,
+            json={
+                "code": "G_RADIUS",
+                "name": "Group Radius",
+                "active": True,
+            },
+        )
+        self.assertEqual(create_group_res.status_code, 200, create_group_res.text)
+        group_id = create_group_res.json()["id"]
+
+        too_small_res = self.client.post(
+            f"/groups/{group_id}/geofences",
+            headers=headers,
+            json={
+                "name": "Too Small",
+                "latitude": 10.7769,
+                "longitude": 106.7009,
+                "radius_m": 10,
+                "active": True,
+            },
+        )
+        self.assertEqual(too_small_res.status_code, 422, too_small_res.text)
+
+        warning_res = self.client.post(
+            f"/groups/{group_id}/geofences",
+            headers=headers,
+            json={
+                "name": "Warning Radius",
+                "latitude": 10.7769,
+                "longitude": 106.7009,
+                "radius_m": 350,
+                "active": True,
+            },
+        )
+        self.assertEqual(warning_res.status_code, 200, warning_res.text)
+        self.assertEqual(warning_res.json()["radius_m"], 350)
+        self.assertEqual(
+            warning_res.json().get("radius_policy_warning"),
+            "RADIUS_ABOVE_POLICY_THRESHOLD",
+        )
+
+        list_res = self.client.get(
+            f"/groups/{group_id}/geofences",
+            headers=headers,
+        )
+        self.assertEqual(list_res.status_code, 200, list_res.text)
+        self.assertEqual(list_res.json()[0]["radius_m"], 350)
+        self.assertEqual(
+            list_res.json()[0].get("radius_policy_warning"),
+            "RADIUS_ABOVE_POLICY_THRESHOLD",
+        )
 
     def test_checkin_checkout_flow(self) -> None:
         user = self._create_user(email="staff@example.com", password="staff123", role="USER")
@@ -738,6 +1035,112 @@ class MinimumFlowsTestCase(unittest.TestCase):
 
         _FixedDateTime.fixed_now = None
 
+    def test_missed_checkout_auto_exception_resolve_and_reopen(self) -> None:
+        admin = self._create_user(email="admin_missed@example.com", password="admin123", role="ADMIN")
+        user = self._create_user(email="missed_user@example.com", password="user123", role="USER")
+
+        self._create_employee(code="EM015", full_name="Missed Checkout User", user_id=user.id)
+        self._create_rule(
+            latitude=10.7769,
+            longitude=106.7009,
+            radius_m=300,
+            start_time=time(8, 0),
+            grace_minutes=30,
+            end_time=time(17, 0),
+            checkout_grace_minutes=0,
+            cross_day_cutoff_minutes=240,
+        )
+
+        token = self._login("missed_user@example.com", "user123")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 10, 1, 0, tzinfo=timezone.utc)  # 08:00 VN
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            in_res = self.client.post(
+                "/attendance/checkin",
+                headers=headers,
+                json={"lat": 10.7769, "lng": 106.7009},
+            )
+        self.assertEqual(in_res.status_code, 200, in_res.text)
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 10, 11, 30, tzinfo=timezone.utc)  # 18:30 VN
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            status_res = self.client.get("/attendance/status", headers=headers)
+        self.assertEqual(status_res.status_code, 200, status_res.text)
+        self.assertEqual(status_res.json()["warning_code"], "MISSED_CHECKOUT")
+        self.assertEqual(status_res.json()["warning_date"], "2026-03-10")
+        self.assertTrue(status_res.json()["can_checkout"])
+
+        admin_token = self._login("admin_missed@example.com", "admin123")
+        admin_headers = {"Authorization": f"Bearer {admin_token}"}
+
+        exception_res = self.client.get(
+            "/reports/attendance-exceptions?from=2026-03-10&to=2026-03-10&exception_type=MISSED_CHECKOUT",
+            headers=admin_headers,
+        )
+        self.assertEqual(exception_res.status_code, 200, exception_res.text)
+        rows = [r for r in exception_res.json() if r["employee_code"] == "EM015"]
+        self.assertTrue(rows)
+        exception_id = rows[0]["id"]
+
+        resolve_missing_time_res = self.client.patch(
+            f"/reports/attendance-exceptions/{exception_id}/resolve",
+            headers=admin_headers,
+            json={"note": "Try resolve without actual time"},
+        )
+        self.assertEqual(resolve_missing_time_res.status_code, 400, resolve_missing_time_res.text)
+        self.assertIn("actual_checkout_time is required", resolve_missing_time_res.text)
+
+        resolve_ok_res = self.client.patch(
+            f"/reports/attendance-exceptions/{exception_id}/resolve",
+            headers=admin_headers,
+            json={
+                "note": "Admin entered actual checkout",
+                "actual_checkout_time": "2026-03-10T10:30:00+00:00",
+            },
+        )
+        self.assertEqual(resolve_ok_res.status_code, 200, resolve_ok_res.text)
+        resolved = resolve_ok_res.json()
+        self.assertEqual(resolved["status"], "RESOLVED")
+        self.assertEqual(resolved["resolved_by"], admin.id)
+        self.assertIsNotNone(resolved["actual_checkout_time"])
+
+        daily_resolved = self.client.get(
+            "/attendance/report/daily?from_date=2026-03-10&to_date=2026-03-10",
+            headers=admin_headers,
+        )
+        self.assertEqual(daily_resolved.status_code, 200, daily_resolved.text)
+        resolved_row = next(r for r in daily_resolved.json() if r["employee_code"] == "EM015")
+        self.assertEqual(resolved_row["exception_status"], "RESOLVED")
+        self.assertEqual(resolved_row["attendance_state"], "COMPLETE")
+        self.assertEqual(resolved_row["checkout_status"], "LATE")
+        self.assertEqual(resolved_row["regular_minutes"], 540)
+        self.assertEqual(resolved_row["overtime_minutes"], 30)
+        self.assertEqual(resolved_row["payable_overtime_minutes"], 30)
+
+        reopen_res = self.client.patch(
+            f"/reports/attendance-exceptions/{exception_id}/reopen",
+            headers=admin_headers,
+            json={"note": "Need verify again"},
+        )
+        self.assertEqual(reopen_res.status_code, 200, reopen_res.text)
+        reopened = reopen_res.json()
+        self.assertEqual(reopened["status"], "OPEN")
+        self.assertIsNone(reopened["resolved_by"])
+        self.assertIsNone(reopened["actual_checkout_time"])
+
+        daily_reopened = self.client.get(
+            "/attendance/report/daily?from_date=2026-03-10&to_date=2026-03-10",
+            headers=admin_headers,
+        )
+        self.assertEqual(daily_reopened.status_code, 200, daily_reopened.text)
+        reopened_row = next(r for r in daily_reopened.json() if r["employee_code"] == "EM015")
+        self.assertEqual(reopened_row["exception_status"], "OPEN")
+        self.assertEqual(reopened_row["attendance_state"], "PENDING_TIMESHEET")
+        self.assertEqual(reopened_row["checkout_status"], "NO_CHECKOUT")
+        self.assertEqual(reopened_row["payable_overtime_minutes"], 0)
+
+        _FixedDateTime.fixed_now = None
     def test_resolve_and_reopen_exception_recalculates_minutes(self) -> None:
         admin = self._create_user(email="admin_resolve@example.com", password="admin123", role="ADMIN")
         user = self._create_user(email="resolve_user@example.com", password="user123", role="USER")
@@ -782,6 +1185,15 @@ class MinimumFlowsTestCase(unittest.TestCase):
         rows = [r for r in exception_res.json() if r["employee_code"] == "EM013"]
         self.assertTrue(rows)
         exception_id = rows[0]["id"]
+
+        resolve_missing_time_res = self.client.patch(
+            f"/reports/attendance-exceptions/{exception_id}/resolve",
+            headers=admin_headers,
+            json={"note": "AUTO_CLOSED requires actual checkout"},
+        )
+        self.assertEqual(resolve_missing_time_res.status_code, 400, resolve_missing_time_res.text)
+        self.assertIn("actual_checkout_time is required for AUTO_CLOSED", resolve_missing_time_res.text)
+
 
         resolve_res = self.client.patch(
             f"/reports/attendance-exceptions/{exception_id}/resolve",
@@ -865,6 +1277,84 @@ class MinimumFlowsTestCase(unittest.TestCase):
             self.assertEqual(count_exceptions, 0)
 
         _FixedDateTime.fixed_now = None
+    def test_distance_consistency_warning_is_synced_between_daily_and_excel(self) -> None:
+        admin = self._create_user(email="admin_distance_warn@example.com", password="admin123", role="ADMIN")
+        user = self._create_user(email="distance_warn_user@example.com", password="user123", role="USER")
+
+        self._create_employee(code="EM014", full_name="Distance Warning User", user_id=user.id)
+        self._create_rule(latitude=10.7769, longitude=106.7009, radius_m=200)
+
+        user_token = self._login("distance_warn_user@example.com", "user123")
+        user_headers = {"Authorization": f"Bearer {user_token}"}
+
+        in_res = self.client.post(
+            "/attendance/checkin",
+            headers=user_headers,
+            json={"lat": 10.7769, "lng": 106.7009},
+        )
+        self.assertEqual(in_res.status_code, 200, in_res.text)
+
+        out_res = self.client.post(
+            "/attendance/checkout",
+            headers=user_headers,
+            json={"lat": 10.7769, "lng": 106.7009},
+        )
+        self.assertEqual(out_res.status_code, 200, out_res.text)
+
+        with SessionLocal() as db:
+            emp = db.query(Employee).filter(Employee.user_id == user.id).first()
+            self.assertIsNotNone(emp)
+            logs = db.query(AttendanceLog).filter(AttendanceLog.employee_id == emp.id).all()
+            self.assertTrue(logs)
+            for log in logs:
+                log.distance_m = 350.0
+                log.is_out_of_range = False
+            db.commit()
+
+        admin_token = self._login("admin_distance_warn@example.com", "admin123")
+        admin_headers = {"Authorization": f"Bearer {admin_token}"}
+
+        today = date.today().isoformat()
+        daily_res = self.client.get(
+            f"/attendance/report/daily?from_date={today}&to_date={today}",
+            headers=admin_headers,
+        )
+        self.assertEqual(daily_res.status_code, 200, daily_res.text)
+
+        daily_rows = [r for r in daily_res.json() if r["employee_code"] == "EM014"]
+        self.assertTrue(daily_rows)
+        daily_row = daily_rows[0]
+        self.assertEqual(daily_row["out_of_range"], False)
+        self.assertEqual(daily_row["radius_m"], 200)
+        self.assertEqual(
+            daily_row["distance_consistency_warning"],
+            "IN_RANGE_DISTANCE_EXCEEDS_RADIUS",
+        )
+
+        excel_res = self.client.get(
+            f"/reports/attendance.xlsx?from={today}&to={today}",
+            headers=admin_headers,
+        )
+        self.assertEqual(excel_res.status_code, 200, excel_res.text)
+
+        workbook = load_workbook(BytesIO(excel_res.content))
+        worksheet = workbook.active
+        headers = [cell.value for cell in worksheet[1]]
+        header_index = {name: idx + 1 for idx, name in enumerate(headers)}
+
+        found = False
+        for row_idx in range(2, worksheet.max_row + 1):
+            code = worksheet.cell(row=row_idx, column=header_index["employee_code"]).value
+            if code != "EM014":
+                continue
+            found = True
+            radius_value = worksheet.cell(row=row_idx, column=header_index["radius_m"]).value
+            warning_value = worksheet.cell(row=row_idx, column=header_index["distance_consistency_warning"]).value
+            self.assertEqual(radius_value, 200)
+            self.assertEqual(warning_value, "IN_RANGE_DISTANCE_EXCEEDS_RADIUS")
+            break
+
+        self.assertTrue(found)
     def test_export_report_flow(self) -> None:
         admin = self._create_user(email="admin_report@example.com", password="admin123", role="ADMIN")
         user = self._create_user(email="user_report@example.com", password="user123", role="USER")
@@ -911,7 +1401,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
         worksheet = workbook.active
 
         headers = [cell.value for cell in worksheet[1]]
-        for required_header in ("group_code", "group_name", "matched_geofence", "geofence_source", "payable_overtime_minutes"):
+        for required_header in ("group_code", "group_name", "matched_geofence", "geofence_source", "radius_m", "distance_consistency_warning", "payable_overtime_minutes"):
             self.assertIn(required_header, headers)
 
         header_index = {name: idx + 1 for idx, name in enumerate(headers)}
@@ -924,7 +1414,208 @@ class MinimumFlowsTestCase(unittest.TestCase):
         self.assertEqual(worksheet.cell(row=2, column=header_index["out_of_range"]).value, "IN_RANGE")
 
 
+
+    def test_geofence_radius_small_vs_large_affects_out_of_range(self) -> None:
+        user = self._create_user(email="radius_compare_user@example.com", password="user123", role="USER")
+        self._create_employee(code="EM015", full_name="Radius Compare", user_id=user.id)
+
+        self._create_rule(latitude=10.7769, longitude=106.7009, radius_m=20)
+
+        token = self._login("radius_compare_user@example.com", "user123")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 10, 2, 0, tzinfo=timezone.utc)
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            day1_in = self.client.post(
+                "/attendance/checkin",
+                headers=headers,
+                json={"lat": 10.7774, "lng": 106.7009},
+            )
+        self.assertEqual(day1_in.status_code, 200, day1_in.text)
+        self.assertTrue(day1_in.json()["log"]["is_out_of_range"])
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 10, 3, 0, tzinfo=timezone.utc)
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            day1_out = self.client.post(
+                "/attendance/checkout",
+                headers=headers,
+                json={"lat": 10.7774, "lng": 106.7009},
+            )
+        self.assertEqual(day1_out.status_code, 200, day1_out.text)
+        self.assertTrue(day1_out.json()["log"]["is_out_of_range"])
+
+        with SessionLocal() as db:
+            active_rule = db.query(CheckinRule).filter(CheckinRule.active.is_(True)).first()
+            self.assertIsNotNone(active_rule)
+            assert active_rule is not None
+            active_rule.radius_m = 500
+            db.commit()
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 11, 2, 0, tzinfo=timezone.utc)
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            day2_in = self.client.post(
+                "/attendance/checkin",
+                headers=headers,
+                json={"lat": 10.7774, "lng": 106.7009},
+            )
+        self.assertEqual(day2_in.status_code, 200, day2_in.text)
+        self.assertFalse(day2_in.json()["log"]["is_out_of_range"])
+
+        _FixedDateTime.fixed_now = None
+
+    def test_cross_day_cutoff_daily_and_excel_are_consistent(self) -> None:
+        admin = self._create_user(email="admin_cross_day_consistency@example.com", password="admin123", role="ADMIN")
+        user = self._create_user(email="cross_day_consistency_user@example.com", password="user123", role="USER")
+
+        self._create_employee(code="EM016", full_name="Cross Day Consistency", user_id=user.id)
+        self._create_rule(
+            latitude=10.7769,
+            longitude=106.7009,
+            radius_m=300,
+            start_time=time(8, 0),
+            grace_minutes=30,
+            end_time=time(17, 0),
+            checkout_grace_minutes=0,
+            cross_day_cutoff_minutes=240,
+        )
+
+        user_token = self._login("cross_day_consistency_user@example.com", "user123")
+        user_headers = {"Authorization": f"Bearer {user_token}"}
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 10, 1, 0, tzinfo=timezone.utc)
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            in_res = self.client.post(
+                "/attendance/checkin",
+                headers=user_headers,
+                json={"lat": 10.7769, "lng": 106.7009},
+            )
+        self.assertEqual(in_res.status_code, 200, in_res.text)
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 10, 19, 30, tzinfo=timezone.utc)
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            out_res = self.client.post(
+                "/attendance/checkout",
+                headers=user_headers,
+                json={"lat": 10.7769, "lng": 106.7009},
+            )
+        self.assertEqual(out_res.status_code, 200, out_res.text)
+
+        admin_token = self._login("admin_cross_day_consistency@example.com", "admin123")
+        admin_headers = {"Authorization": f"Bearer {admin_token}"}
+
+        daily_res = self.client.get(
+            "/attendance/report/daily?from_date=2026-03-10&to_date=2026-03-10",
+            headers=admin_headers,
+        )
+        self.assertEqual(daily_res.status_code, 200, daily_res.text)
+        daily_row = next(r for r in daily_res.json() if r["employee_code"] == "EM016")
+
+        excel_res = self.client.get(
+            "/reports/attendance.xlsx?from=2026-03-10&to=2026-03-10",
+            headers=admin_headers,
+        )
+        self.assertEqual(excel_res.status_code, 200, excel_res.text)
+
+        workbook = load_workbook(BytesIO(excel_res.content))
+        worksheet = workbook.active
+        headers = [cell.value for cell in worksheet[1]]
+        header_index = {name: idx + 1 for idx, name in enumerate(headers)}
+
+        excel_row_idx = None
+        for row_idx in range(2, worksheet.max_row + 1):
+            if worksheet.cell(row=row_idx, column=header_index["employee_code"]).value == "EM016":
+                excel_row_idx = row_idx
+                break
+
+        self.assertIsNotNone(excel_row_idx)
+        assert excel_row_idx is not None
+
+        self.assertEqual(worksheet.cell(row=excel_row_idx, column=header_index["regular_minutes"]).value, daily_row["regular_minutes"])
+        self.assertEqual(worksheet.cell(row=excel_row_idx, column=header_index["overtime_minutes"]).value, daily_row["overtime_minutes"])
+        self.assertEqual(worksheet.cell(row=excel_row_idx, column=header_index["payable_overtime_minutes"]).value, daily_row["payable_overtime_minutes"])
+        self.assertEqual(
+            worksheet.cell(row=excel_row_idx, column=header_index["overtime_cross_day"]).value,
+            "YES" if daily_row["overtime_cross_day"] else "NO",
+        )
+
+        _FixedDateTime.fixed_now = None
+
+    def test_race_condition_checkout_concurrent_only_one_out_log(self) -> None:
+        user = self._create_user(email="race_checkout_user@example.com", password="user123", role="USER")
+        self._create_employee(code="EM017", full_name="Race Checkout", user_id=user.id)
+        self._create_rule(latitude=10.7769, longitude=106.7009, radius_m=300)
+
+        token = self._login("race_checkout_user@example.com", "user123")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        in_res = self.client.post(
+            "/attendance/checkin",
+            headers=headers,
+            json={"lat": 10.7769, "lng": 106.7009},
+        )
+        self.assertEqual(in_res.status_code, 200, in_res.text)
+
+        barrier = threading.Barrier(2)
+        results: list[tuple[str, int | str]] = []
+        lock = threading.Lock()
+
+        def _worker_checkout() -> None:
+            with SessionLocal() as db:
+                user_obj = db.query(User).filter(User.id == user.id).first()
+                assert user_obj is not None
+                payload = LocationRequest(lat=10.7769, lng=106.7009)
+                barrier.wait()
+                try:
+                    attendance_api.checkout(payload, db=db, user=user_obj)
+                    item: tuple[str, int | str] = ("ok", 200)
+                except HTTPException as exc:
+                    item = ("http", exc.status_code)
+                except Exception as exc:  # pragma: no cover - should not happen
+                    item = ("error", str(exc))
+            with lock:
+                results.append(item)
+
+        t1 = threading.Thread(target=_worker_checkout)
+        t2 = threading.Thread(target=_worker_checkout)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        self.assertEqual(len(results), 2)
+
+        ok_count = sum(1 for kind, _ in results if kind == "ok")
+        http_400_count = sum(1 for kind, code in results if kind == "http" and code == 400)
+        errors = [value for kind, value in results if kind == "error"]
+
+        self.assertEqual(errors, [])
+        self.assertEqual(ok_count, 1)
+        self.assertEqual(http_400_count, 1)
+
+        with SessionLocal() as db:
+            emp = db.query(Employee).filter(Employee.user_id == user.id).first()
+            self.assertIsNotNone(emp)
+            out_logs = (
+                db.query(AttendanceLog)
+                .filter(
+                    AttendanceLog.employee_id == emp.id,
+                    AttendanceLog.type == "OUT",
+                )
+                .all()
+            )
+            self.assertEqual(len(out_logs), 1)
 if __name__ == "__main__":
     unittest.main()
+
+
+
+
+
+
+
+
+
+
+
 
 
