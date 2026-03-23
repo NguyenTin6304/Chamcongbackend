@@ -13,6 +13,7 @@ def main() -> None:
         default=f"{settings.RESET_PASSWORD_URL_BASE}?token=demo-token",
         help="Reset password URL",
     )
+    parser.add_argument("--token", default="demo-token", help="Reset token text")
     parser.add_argument("--expires", type=int, default=settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES)
     args = parser.parse_args()
 
@@ -21,6 +22,7 @@ def main() -> None:
         ResetPasswordMail(
             to_email=args.to,
             reset_url=args.url,
+            reset_token=args.token,
             expires_minutes=args.expires,
         )
     )

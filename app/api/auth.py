@@ -1,7 +1,7 @@
 ﻿import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -30,6 +30,7 @@ from app.schemas.auth import (
     UserMeResponse,
 )
 from app.services.auth.password_reset_service import PasswordResetService
+from app.services.mail.base import ResetPasswordMail
 from app.services.mail.factory import get_mail_sender
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -75,6 +76,13 @@ def _issue_tokens(db: Session, user: User, remember_me: bool) -> TokenResponse:
     )
 
 
+def _send_reset_password_mail_background(payload: ResetPasswordMail) -> None:
+    try:
+        get_mail_sender().send_reset_password(payload)
+    except Exception:
+        logger.exception("Background reset password email send failed. to=%s", payload.to_email)
+
+
 @router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     try:
@@ -101,11 +109,18 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/forgot-password", response_model=MessageResponse)
-def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)):
+def forgot_password(
+    payload: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     try:
         service = PasswordResetService(db=db, mail_sender=get_mail_sender())
-        service.request_password_reset(payload.email)
+        mail_payload = service.prepare_password_reset(payload.email)
         db.commit()
+
+        if mail_payload is not None:
+            background_tasks.add_task(_send_reset_password_mail_background, mail_payload)
     except Exception:
         db.rollback()
         logger.exception("Forgot password failed internally")

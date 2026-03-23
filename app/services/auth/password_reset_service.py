@@ -16,21 +16,29 @@ class PasswordResetService:
         self._db = db
         self._mail_sender = mail_sender
 
-    def request_password_reset(self, email: str) -> None:
+    def prepare_password_reset(self, email: str) -> ResetPasswordMail | None:
         user = self._db.query(User).filter(func.lower(User.email) == email.lower().strip()).first()
         if not user:
-            return
+            return None
 
         raw_token = self._issue_reset_token(user_id=user.id)
         reset_url = self._build_reset_url(raw_token)
-        self._mail_sender.send_reset_password(
-            ResetPasswordMail(
-                to_email=user.email,
-                reset_url=reset_url,
-                reset_token=raw_token,
-                expires_minutes=settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES,
-            )
+
+        return ResetPasswordMail(
+            to_email=user.email,
+            reset_url=reset_url,
+            reset_token=raw_token,
+            expires_minutes=settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES,
         )
+
+    def send_password_reset_mail(self, payload: ResetPasswordMail) -> None:
+        self._mail_sender.send_reset_password(payload)
+
+    def request_password_reset(self, email: str) -> None:
+        payload = self.prepare_password_reset(email)
+        if payload is None:
+            return
+        self.send_password_reset_mail(payload)
 
     def reset_password(self, token: str, new_password: str) -> None:
         token = token.strip()
