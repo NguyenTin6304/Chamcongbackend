@@ -5,6 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
+        env_file_encoding="utf-8-sig",
         case_sensitive=False,
         extra="ignore",
     )
@@ -48,5 +49,16 @@ class Settings(BaseSettings):
     RESEND_RETRY_DELAY_SEC: float = 1.0
     RESET_PASSWORD_URL_BASE: str = "http://localhost:62601/#/reset-password"
 
+    RECAPTCHA_ENABLED: bool = False
+    RECAPTCHA_SECRET_KEY: str = ""
+    RECAPTCHA_MIN_SCORE: float = 0.5
+    RECAPTCHA_VERIFY_TIMEOUT_SEC: int = 5
+    RECAPTCHA_EXPECTED_ACTION: str = ""
+    # Optional comma-separated hostnames. Example: "localhost,chamcongweb.vercel.app"
+    RECAPTCHA_ALLOWED_HOSTNAMES: str = ""
+
 
 settings = Settings()
+
+
+

@@ -16,6 +16,7 @@ class LoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=6, max_length=128)
     remember_me: bool = True
+    recaptcha_token: str | None = None
 
 
 class TokenResponse(BaseModel):

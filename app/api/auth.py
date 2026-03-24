@@ -1,7 +1,7 @@
 ﻿import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -30,6 +30,7 @@ from app.schemas.auth import (
     UserMeResponse,
 )
 from app.services.auth.password_reset_service import PasswordResetService
+from app.services.auth.recaptcha_service import verify_login_recaptcha
 from app.services.mail.base import ResetPasswordMail
 from app.services.mail.factory import get_mail_sender
 
@@ -42,7 +43,10 @@ GENERIC_FORGOT_PASSWORD_MESSAGE = "Nếu email tồn tại, hệ thống đã g�
 def _authenticate_user(db: Session, email: str, password: str) -> User:
     user = db.query(User).filter(User.email == email).first()
     if not user or not verify_password(password, user.password_hash):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sai mật khẩu hoặc email xin vui lòng thử lại")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Sai mật khẩu hoặc email xin vui lòng thử lại",
+        )
     return user
 
 
@@ -83,6 +87,15 @@ def _send_reset_password_mail_background(payload: ResetPasswordMail) -> None:
         logger.exception("Background reset password email send failed. to=%s", payload.to_email)
 
 
+def _get_request_ip(request: Request) -> str | None:
+    if request.client is None:
+        return None
+    host = request.client.host
+    if not host:
+        return None
+    return host
+
+
 @router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     try:
@@ -97,11 +110,12 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
         return RegisterResponse(id=user.id, email=user.email, role=user.role)
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=400, detail="Email đã tồn tại hãy thử với email khác")
+        raise HTTPException(status_code=400, detail="Email đã tồn tại hãy thử với email khác")
 
 
 @router.post("/login", response_model=TokenResponse)
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
+def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)):
+    verify_login_recaptcha(token=payload.recaptcha_token, remote_ip=_get_request_ip(request))
     user = _authenticate_user(db, payload.email, payload.password)
     tokens = _issue_tokens(db, user, remember_me=payload.remember_me)
     db.commit()
@@ -160,6 +174,15 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
 @router.post("/login-form", response_model=TokenResponse, deprecated=True)
 def login_form(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     # Legacy compatibility endpoint: form-data (username/password).
+    if settings.RECAPTCHA_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "RECAPTCHA_REQUIRED",
+                "message": "reCAPTCHA đang bật. Hãy dùng endpoint /auth/login",
+            },
+        )
+
     user = _authenticate_user(db, form_data.username, form_data.password)
     tokens = _issue_tokens(db, user, remember_me=True)
     db.commit()
@@ -167,8 +190,9 @@ def login_form(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = D
 
 
 @router.post("/login-json", response_model=TokenResponse, deprecated=True)
-def login_json(payload: LoginRequest, db: Session = Depends(get_db)):
+def login_json(payload: LoginRequest, request: Request, db: Session = Depends(get_db)):
     # Deprecated alias of /auth/login for backward compatibility.
+    verify_login_recaptcha(token=payload.recaptcha_token, remote_ip=_get_request_ip(request))
     user = _authenticate_user(db, payload.email, payload.password)
     tokens = _issue_tokens(db, user, remember_me=payload.remember_me)
     db.commit()
