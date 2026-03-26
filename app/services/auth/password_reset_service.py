@@ -129,7 +129,10 @@ class PasswordResetService:
         query_items = dict(parse_qsl(parsed.query, keep_blank_values=True))
         query_items["token"] = raw_token
         new_query = urlencode(query_items)
-        return urlunparse(parsed._replace(path=path, query=new_query))
+        # Keep token in both query and hash fragment so link still works
+        # when frontend uses hash routing in deployed SPA environments.
+        new_fragment = f"{path}?{urlencode({'token': raw_token})}"
+        return urlunparse(parsed._replace(path=path, query=new_query, fragment=new_fragment))
 
 
 def cleanup_password_reset_tokens(

@@ -429,6 +429,16 @@ class MinimumFlowsTestCase(unittest.TestCase):
         self.assertNotIn("?token=#/reset-password", reset_url)
         self.assertNotIn("token=&", reset_url)
 
+    def test_password_reset_url_builder_path_base_keeps_token_for_hash_router(self) -> None:
+        with patch(
+            "app.services.auth.password_reset_service.settings.RESET_PASSWORD_URL_BASE",
+            "https://chamcongweb-uat.vercel.app/reset-password",
+        ):
+            reset_url = PasswordResetService._build_reset_url("abc-token")
+
+        self.assertIn("/reset-password?token=abc-token", reset_url)
+        self.assertIn("#/reset-password?token=abc-token", reset_url)
+
     def test_password_reset_cleanup_removes_expired_and_old_used_tokens(self) -> None:
         user = self._create_user(email="cleanup_reset@example.com", password="oldpass123", role="USER")
         now_utc = datetime(2026, 3, 19, 0, 0, tzinfo=timezone.utc)
