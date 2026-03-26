@@ -1,5 +1,5 @@
 ﻿MIN_GEOFENCE_RADIUS_M = 20
-MAX_GEOFENCE_RADIUS_M = 500
+MAX_GEOFENCE_RADIUS_M = 2000
 WARN_GEOFENCE_RADIUS_M = 300
 
 # Coarse VN bounding box for quick anomaly checks in audit scripts.
