@@ -130,6 +130,13 @@ class AttendanceLog(Base):
     matched_geofence_name = Column(String(255), nullable=True)
     geofence_source = Column(String(20), nullable=True)
     fallback_reason = Column(String(100), nullable=True)
+    risk_score = Column(Integer, nullable=True)
+    risk_level = Column(String(10), nullable=True)
+    risk_flags = Column(Text, nullable=True)
+    risk_policy_version = Column(String(32), nullable=True)
+    ip = Column(String(64), nullable=True)
+    ua_hash = Column(String(64), nullable=True)
+    accuracy_m = Column(Float, nullable=True)
 
     # Snapshot at check-in time to keep payroll calculation stable even if rules change later.
     snapshot_start_time = Column(Time, nullable=True)
@@ -149,10 +156,11 @@ class AttendanceException(Base):
     id = Column(Integer, primary_key=True)
     employee_id = Column(Integer, ForeignKey("employees.id"), nullable=False, index=True)
     source_checkin_log_id = Column(Integer, ForeignKey("attendance_logs.id"), nullable=False, unique=True)
-    exception_type = Column(String(50), nullable=False, index=True)  # MISSED_CHECKOUT/AUTO_CLOSED
+    exception_type = Column(String(50), nullable=False, index=True)  # MISSED_CHECKOUT/AUTO_CLOSED/SUSPECTED_LOCATION_SPOOF
     work_date = Column(Date, nullable=False)
     status = Column(String(20), nullable=False, default="OPEN")  # OPEN/RESOLVED
     note = Column(Text, nullable=True)
+    resolved_note = Column(Text, nullable=True)
     actual_checkout_time = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     resolved_by = Column(Integer, ForeignKey("users.id"), nullable=True)

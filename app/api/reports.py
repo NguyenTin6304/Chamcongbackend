@@ -1,5 +1,6 @@
 ﻿from datetime import date, datetime, time, timedelta, timezone
 from io import BytesIO
+import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -29,6 +30,24 @@ from app.services.report_consistency import (
 router = APIRouter(prefix="/reports", tags=["reports"])
 VN_TZ = timezone(timedelta(hours=7))
 UTC_TZ = timezone.utc
+
+
+def _deserialize_risk_flags(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if isinstance(parsed, list):
+        return [str(x) for x in parsed if str(x).strip()]
+    return []
+
+
+def _normalize_exception_type(value: str) -> str:
+    if value == "GPS_RISK":
+        return "SUSPECTED_LOCATION_SPOOF"
+    return value
 
 
 def _rank_to_punctuality(rank_value) -> str | None:
@@ -346,8 +365,13 @@ def _build_exception_response(db: Session, exception_id: int) -> AttendanceExcep
             AttendanceException.exception_type.label("exception_type"),
             AttendanceException.status.label("status"),
             AttendanceException.note.label("note"),
+            AttendanceException.resolved_note.label("resolved_note"),
             AttendanceException.source_checkin_log_id.label("source_checkin_log_id"),
             AttendanceLog.time.label("source_checkin_time"),
+            AttendanceLog.risk_score.label("risk_score"),
+            AttendanceLog.risk_level.label("risk_level"),
+            AttendanceLog.risk_flags.label("risk_flags"),
+            AttendanceLog.risk_policy_version.label("risk_policy_version"),
             AttendanceException.actual_checkout_time.label("actual_checkout_time"),
             AttendanceException.created_at.label("created_at"),
             AttendanceException.resolved_at.label("resolved_at"),
@@ -373,9 +397,14 @@ def _build_exception_response(db: Session, exception_id: int) -> AttendanceExcep
         group_code=row.group_code,
         group_name=row.group_name,
         work_date=row.work_date,
-        exception_type=row.exception_type,
+        exception_type=_normalize_exception_type(row.exception_type),
         status=row.status,
         note=row.note,
+        resolved_note=row.resolved_note,
+        risk_score=row.risk_score,
+        risk_level=row.risk_level,
+        risk_flags=_deserialize_risk_flags(row.risk_flags),
+        risk_policy_version=row.risk_policy_version,
         source_checkin_log_id=row.source_checkin_log_id,
         source_checkin_time=row.source_checkin_time,
         actual_checkout_time=row.actual_checkout_time,
@@ -615,8 +644,13 @@ def list_attendance_exceptions(
         raise HTTPException(status_code=400, detail="'from' must be <= 'to'")
 
     normalized_exception_type = exception_type.strip().upper()
-    if normalized_exception_type not in {"MISSED_CHECKOUT", "AUTO_CLOSED"}:
-        raise HTTPException(status_code=400, detail="exception_type must be MISSED_CHECKOUT or AUTO_CLOSED")
+    if normalized_exception_type == "GPS_RISK":
+        normalized_exception_type = "SUSPECTED_LOCATION_SPOOF"
+    if normalized_exception_type not in {"MISSED_CHECKOUT", "AUTO_CLOSED", "SUSPECTED_LOCATION_SPOOF"}:
+        raise HTTPException(
+            status_code=400,
+            detail="exception_type must be MISSED_CHECKOUT, AUTO_CLOSED or SUSPECTED_LOCATION_SPOOF",
+        )
 
     normalized_status = status_filter.strip().upper() if status_filter else None
     if normalized_status and normalized_status not in {"OPEN", "RESOLVED"}:
@@ -637,8 +671,13 @@ def list_attendance_exceptions(
             AttendanceException.exception_type.label("exception_type"),
             AttendanceException.status.label("status"),
             AttendanceException.note.label("note"),
+            AttendanceException.resolved_note.label("resolved_note"),
             AttendanceException.source_checkin_log_id.label("source_checkin_log_id"),
             AttendanceLog.time.label("source_checkin_time"),
+            AttendanceLog.risk_score.label("risk_score"),
+            AttendanceLog.risk_level.label("risk_level"),
+            AttendanceLog.risk_flags.label("risk_flags"),
+            AttendanceLog.risk_policy_version.label("risk_policy_version"),
             AttendanceException.actual_checkout_time.label("actual_checkout_time"),
             AttendanceException.created_at.label("created_at"),
             AttendanceException.resolved_at.label("resolved_at"),
@@ -649,8 +688,11 @@ def list_attendance_exceptions(
         .outerjoin(Group, Group.id == Employee.group_id)
         .outerjoin(AttendanceLog, AttendanceLog.id == AttendanceException.source_checkin_log_id)
         .outerjoin(resolver, resolver.id == AttendanceException.resolved_by)
-        .filter(AttendanceException.exception_type == normalized_exception_type)
     )
+    if normalized_exception_type == "SUSPECTED_LOCATION_SPOOF":
+        q = q.filter(AttendanceException.exception_type.in_(["SUSPECTED_LOCATION_SPOOF", "GPS_RISK"]))
+    else:
+        q = q.filter(AttendanceException.exception_type == normalized_exception_type)
 
     if employee_id:
         q = q.filter(AttendanceException.employee_id == employee_id)
@@ -674,9 +716,14 @@ def list_attendance_exceptions(
             group_code=row.group_code,
             group_name=row.group_name,
             work_date=row.work_date,
-            exception_type=row.exception_type,
+            exception_type=_normalize_exception_type(row.exception_type),
             status=row.status,
             note=row.note,
+            resolved_note=row.resolved_note,
+            risk_score=row.risk_score,
+            risk_level=row.risk_level,
+            risk_flags=_deserialize_risk_flags(row.risk_flags),
+            risk_policy_version=row.risk_policy_version,
             source_checkin_log_id=row.source_checkin_log_id,
             source_checkin_time=row.source_checkin_time,
             actual_checkout_time=row.actual_checkout_time,
@@ -703,23 +750,31 @@ def resolve_attendance_exception(
     source_checkin = db.query(AttendanceLog).filter(AttendanceLog.id == exception.source_checkin_log_id).first()
     if source_checkin is None:
         raise HTTPException(status_code=400, detail="source check-in log not found")
+    normalized_exception_type = _normalize_exception_type(exception.exception_type)
+    if normalized_exception_type == "SUSPECTED_LOCATION_SPOOF":
+        if payload.note is None or not payload.note.strip():
+            raise HTTPException(status_code=400, detail="note is required for SUSPECTED_LOCATION_SPOOF resolve")
 
-    if payload.actual_checkout_time is None:
-        if exception.exception_type == "AUTO_CLOSED":
-            raise HTTPException(status_code=400, detail="actual_checkout_time is required for AUTO_CLOSED")
-        raise HTTPException(status_code=400, detail="actual_checkout_time is required for MISSED_CHECKOUT")
+    if normalized_exception_type in {"AUTO_CLOSED", "MISSED_CHECKOUT"}:
+        if payload.actual_checkout_time is None:
+            if normalized_exception_type == "AUTO_CLOSED":
+                raise HTTPException(status_code=400, detail="actual_checkout_time is required for AUTO_CLOSED")
+            raise HTTPException(status_code=400, detail="actual_checkout_time is required for MISSED_CHECKOUT")
 
-    actual_checkout_utc = normalize_utc(payload.actual_checkout_time)
-    if actual_checkout_utc <= normalize_utc(source_checkin.time):
-        raise HTTPException(status_code=400, detail="actual_checkout_time must be later than source check-in time")
+        actual_checkout_utc = normalize_utc(payload.actual_checkout_time)
+        if actual_checkout_utc <= normalize_utc(source_checkin.time):
+            raise HTTPException(status_code=400, detail="actual_checkout_time must be later than source check-in time")
 
-    _upsert_checkout_log_from_resolution(db, exception, source_checkin, actual_checkout_utc)
-    exception.actual_checkout_time = actual_checkout_utc
+        _upsert_checkout_log_from_resolution(db, exception, source_checkin, actual_checkout_utc)
+        exception.actual_checkout_time = actual_checkout_utc
+    else:
+        exception.actual_checkout_time = payload.actual_checkout_time
 
     exception.status = "RESOLVED"
     exception.resolved_by = admin_user.id
     exception.resolved_at = datetime.now(timezone.utc)
-    if payload.note is not None:
+    exception.resolved_note = payload.note.strip() if payload.note is not None else None
+    if payload.note is not None and normalized_exception_type != "SUSPECTED_LOCATION_SPOOF":
         exception.note = payload.note
 
     db.commit()
@@ -746,6 +801,7 @@ def reopen_attendance_exception(
     exception.status = "OPEN"
     exception.resolved_by = None
     exception.resolved_at = None
+    exception.resolved_note = None
     exception.actual_checkout_time = None
     if payload.note is not None:
         exception.note = payload.note

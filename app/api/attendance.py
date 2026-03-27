@@ -1,11 +1,14 @@
 ﻿from datetime import date, datetime, time, timedelta, timezone
+import hashlib
+import json
 from typing import NamedTuple
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_admin
 from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, User
@@ -21,6 +24,7 @@ from app.services.attendance_time import (
     work_date_cutoff_utc,
 )
 from app.services.geo import haversine_m
+from app.services.location_risk import LocationRiskInput, assess_location_risk
 from app.services.report_consistency import (
     compute_distance_consistency_warning,
     load_group_geofence_radius_maps,
@@ -195,6 +199,101 @@ def _last_log(db: Session, employee_id: int) -> AttendanceLog | None:
     )
 
 
+def _extract_client_ip(request: Request) -> str | None:
+    forwarded_for = request.headers.get("x-forwarded-for", "").strip()
+    if forwarded_for:
+        first_ip = forwarded_for.split(",")[0].strip()
+        if first_ip:
+            return first_ip
+
+    x_real_ip = request.headers.get("x-real-ip", "").strip()
+    if x_real_ip:
+        return x_real_ip
+
+    if request.client and request.client.host:
+        return request.client.host
+    return None
+
+
+def _header_float(request: Request, names: tuple[str, ...]) -> float | None:
+    for name in names:
+        raw = request.headers.get(name)
+        if raw is None:
+            continue
+        try:
+            return float(raw.strip())
+        except ValueError:
+            continue
+    return None
+
+
+def _header_bool(request: Request, names: tuple[str, ...]) -> bool | None:
+    for name in names:
+        raw = request.headers.get(name)
+        if raw is None:
+            continue
+        value = raw.strip().lower()
+        if value in {"1", "true", "yes", "y", "on"}:
+            return True
+        if value in {"0", "false", "no", "n", "off"}:
+            return False
+    return None
+
+
+def _extract_client_ip_geo_lat(request: Request) -> float | None:
+    lat = _header_float(request, ("x-vercel-ip-latitude", "x-ip-latitude", "cf-iplatitude"))
+    if lat is None or lat < -90 or lat > 90:
+        return None
+    return lat
+
+
+def _extract_client_ip_geo_lng(request: Request) -> float | None:
+    lng = _header_float(request, ("x-vercel-ip-longitude", "x-ip-longitude", "cf-iplongitude"))
+    if lng is None or lng < -180 or lng > 180:
+        return None
+    return lng
+
+
+def _extract_client_asn_hint(request: Request) -> str | None:
+    candidates = (
+        "x-vercel-ip-asn",
+        "x-vercel-ip-as-number",
+        "x-vercel-ip-as-organization",
+        "x-ip-asn",
+        "x-ip-as-org",
+    )
+    values = [request.headers.get(name, "").strip() for name in candidates]
+    merged = " ".join(value for value in values if value)
+    return merged or None
+
+
+def _extract_client_proxy_hint(request: Request) -> bool | None:
+    return _header_bool(request, ("x-ip-proxy", "x-ip-vpn", "x-forwarded-proto-vpn"))
+
+
+def _hash_user_agent(user_agent: str | None) -> str | None:
+    value = (user_agent or "").strip()
+    if not value:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _serialize_risk_flags(flags: list[str]) -> str:
+    return json.dumps(flags, ensure_ascii=True, separators=(",", ":"))
+
+
+def _deserialize_risk_flags(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if isinstance(parsed, list):
+        return [str(x) for x in parsed if str(x).strip()]
+    return []
+
+
 def _get_open_session_checkin(db: Session, employee_id: int) -> AttendanceLog | None:
     last = _last_log(db, employee_id)
     if last and last.type == "IN":
@@ -242,6 +341,7 @@ def _ensure_auto_closed_exception(db: Session, emp: Employee, source_checkin_log
     existing.work_date = work_date
     existing.status = "OPEN"
     existing.note = "System auto closed session at cross-day cutoff"
+    existing.resolved_note = None
 
 
 def _ensure_missed_checkout_exception(
@@ -285,11 +385,66 @@ def _ensure_missed_checkout_exception(
         existing.status = "OPEN"
         existing.resolved_by = None
         existing.resolved_at = None
+        existing.resolved_note = None
         existing.actual_checkout_time = None
         changed = True
     if changed and existing.note != default_note:
         existing.note = default_note
     return changed
+
+
+def _ensure_location_risk_exception(
+    db: Session,
+    emp: Employee,
+    source_checkin_log: AttendanceLog,
+    risk_score: int,
+    risk_level: str,
+    risk_flags: list[str],
+    risk_policy_version: str,
+    action_type: str,
+) -> None:
+    existing = (
+        db.query(AttendanceException)
+        .filter(AttendanceException.source_checkin_log_id == source_checkin_log.id)
+        .first()
+    )
+    note = (
+        f"GPS risk detected on {action_type}: score={risk_score}, level={risk_level}, "
+        f"flags={','.join(risk_flags[:8])}, policy={risk_policy_version}"
+    )
+
+    if existing is None:
+        db.add(
+            AttendanceException(
+                employee_id=emp.id,
+                source_checkin_log_id=source_checkin_log.id,
+                exception_type="SUSPECTED_LOCATION_SPOOF",
+                work_date=source_checkin_log.work_date
+                or compute_work_date(
+                    source_checkin_log.time,
+                    source_checkin_log.snapshot_cutoff_minutes or DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
+                ),
+                status="OPEN",
+                note=note,
+                resolved_note=None,
+            )
+        )
+        return
+
+    if existing.exception_type in {"AUTO_CLOSED", "MISSED_CHECKOUT"}:
+        if existing.note:
+            if "GPS risk detected on" not in existing.note:
+                existing.note = f"{existing.note} | {note}"
+        else:
+            existing.note = note
+        return
+
+    existing.exception_type = "SUSPECTED_LOCATION_SPOOF"
+    existing.status = "OPEN"
+    existing.note = note
+    existing.resolved_note = None
+    existing.resolved_by = None
+    existing.resolved_at = None
 
 
 def _missed_checkout_threshold_utc(open_checkin: AttendanceLog) -> datetime:
@@ -360,6 +515,13 @@ def _auto_close_open_session_if_past_cutoff(
         matched_geofence_name=open_checkin.matched_geofence_name,
         geofence_source=open_checkin.geofence_source,
         fallback_reason=open_checkin.fallback_reason,
+        risk_score=open_checkin.risk_score,
+        risk_level=open_checkin.risk_level,
+        risk_flags=open_checkin.risk_flags,
+        risk_policy_version=open_checkin.risk_policy_version,
+        ip=open_checkin.ip,
+        ua_hash=open_checkin.ua_hash,
+        accuracy_m=open_checkin.accuracy_m,
         snapshot_start_time=open_checkin.snapshot_start_time,
         snapshot_end_time=open_checkin.snapshot_end_time,
         snapshot_grace_minutes=open_checkin.snapshot_grace_minutes,
@@ -419,6 +581,13 @@ def _to_log_response(log: AttendanceLog) -> AttendanceLogResponse:
         is_out_of_range=log.is_out_of_range,
         punctuality_status=log.punctuality_status,
         checkout_status=log.checkout_status,
+        risk_score=log.risk_score,
+        risk_level=log.risk_level,
+        risk_flags=_deserialize_risk_flags(log.risk_flags),
+        risk_policy_version=log.risk_policy_version,
+        ip=log.ip,
+        ua_hash=log.ua_hash,
+        accuracy_m=log.accuracy_m,
     )
 
 
@@ -608,7 +777,12 @@ def my_attendance_status(db: Session = Depends(get_db), user: User = Depends(get
 
 
 @router.post("/checkin", response_model=CheckActionResponse)
-def checkin(payload: LocationRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def checkin(
+    payload: LocationRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     emp = _get_employee_for_user(db, user)
     _lock_employee_row(db, emp.id)
     active_rule = _get_active_rule(db)
@@ -650,6 +824,56 @@ def checkin(payload: LocationRequest, db: Session = Depends(get_db), user: User 
         payload.lng,
         geofences,
     )
+    client_ip = _extract_client_ip(request)
+    user_agent = request.headers.get("user-agent")
+    previous_action = _last_log(db, emp.id)
+    risk_assessment = assess_location_risk(
+        LocationRiskInput(
+            lat=payload.lat,
+            lng=payload.lng,
+            accuracy_m=payload.accuracy_m,
+            timestamp_client=payload.timestamp_client,
+            server_time=checkin_at,
+            ip=client_ip,
+            user_agent=user_agent,
+            accept_language=request.headers.get("accept-language"),
+            ip_geo_lat=_extract_client_ip_geo_lat(request),
+            ip_geo_lng=_extract_client_ip_geo_lng(request),
+            ip_asn=_extract_client_asn_hint(request),
+            ip_proxy_or_vpn=_extract_client_proxy_hint(request),
+            risk_policy_version=settings.RISK_POLICY_VERSION,
+            distance_to_geofence_m=nearest_distance,
+            radius_m=nearest_radius,
+            is_out_of_range=out_of_range,
+            previous_action_time=previous_action.time if previous_action else None,
+            previous_action_lat=previous_action.lat if previous_action else None,
+            previous_action_lng=previous_action.lng if previous_action else None,
+        )
+    )
+    if risk_assessment.decision == "BLOCK":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "LOCATION_RISK_BLOCKED",
+                "message": "Vị trí check-in bị từ chối do rủi ro giả mạo GPS cao.",
+                "details": {
+                    "risk_score": risk_assessment.score,
+                    "risk_level": risk_assessment.level,
+                    "risk_flags": risk_assessment.flags,
+                    "risk_policy_version": risk_assessment.policy_version,
+                    "decision": risk_assessment.decision,
+                    "message": risk_assessment.user_message,
+                },
+            },
+        )
+
+    risk_note = None
+    if risk_assessment.decision != "ALLOW":
+        risk_note = (
+            f"RISK:{risk_assessment.decision};"
+            f"SCORE={risk_assessment.score};"
+            f"FLAGS={','.join(risk_assessment.flags[:6])}"
+        )
 
     log = AttendanceLog(
         employee_id=emp.id,
@@ -671,6 +895,14 @@ def checkin(payload: LocationRequest, db: Session = Depends(get_db), user: User 
         snapshot_cutoff_minutes=time_rule.cutoff_minutes,
         time_rule_source=time_rule.source,
         time_rule_fallback_reason=time_rule.fallback_reason,
+        risk_score=risk_assessment.score,
+        risk_level=risk_assessment.level,
+        risk_flags=_serialize_risk_flags(risk_assessment.flags),
+        risk_policy_version=risk_assessment.policy_version,
+        ip=client_ip,
+        ua_hash=_hash_user_agent(user_agent),
+        accuracy_m=payload.accuracy_m,
+        address_text=risk_note,
     )
 
     db.add(log)
@@ -680,6 +912,18 @@ def checkin(payload: LocationRequest, db: Session = Depends(get_db), user: User 
         db.rollback()
         raise HTTPException(status_code=400, detail="Bạn đã có phiên chấm công cho ngày công này.")
     db.refresh(log)
+    if risk_assessment.decision == "ALLOW_WITH_EXCEPTION":
+        _ensure_location_risk_exception(
+            db=db,
+            emp=emp,
+            source_checkin_log=log,
+            risk_score=risk_assessment.score,
+            risk_level=risk_assessment.level,
+            risk_flags=risk_assessment.flags,
+            risk_policy_version=risk_assessment.policy_version,
+            action_type="IN",
+        )
+        db.commit()
 
     msg = f"Check-in thành công ({punctuality_status}) cho ngày công {_format_vn_date(work_date)}."
     if out_of_range:
@@ -694,17 +938,28 @@ def checkin(payload: LocationRequest, db: Session = Depends(get_db), user: User 
 
     if auto_closed_work_date:
         msg = f"{msg} Hệ thống đã tự đóng phiên cũ ngày {_format_vn_date(auto_closed_work_date)} do qua cutoff."
+    if risk_assessment.decision == "ALLOW_WITH_EXCEPTION":
+        msg = f"{msg} {risk_assessment.user_message}"
 
     return CheckActionResponse(
         log=_to_log_response(log),
         message=msg,
         geofence_source=geofence_source,
         fallback_reason=geofence_fallback_reason,
+        risk_score=risk_assessment.score,
+        risk_level=risk_assessment.level,
+        risk_flags=risk_assessment.flags,
+        decision=risk_assessment.decision,
     )
 
 
 @router.post("/checkout", response_model=CheckActionResponse)
-def checkout(payload: LocationRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def checkout(
+    payload: LocationRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     emp = _get_employee_for_user(db, user)
     _lock_employee_row(db, emp.id)
     active_rule = _get_active_rule(db)
@@ -744,6 +999,56 @@ def checkout(payload: LocationRequest, db: Session = Depends(get_db), user: User
         payload.lng,
         geofences,
     )
+    client_ip = _extract_client_ip(request)
+    user_agent = request.headers.get("user-agent")
+    previous_action = _last_log(db, emp.id)
+    risk_assessment = assess_location_risk(
+        LocationRiskInput(
+            lat=payload.lat,
+            lng=payload.lng,
+            accuracy_m=payload.accuracy_m,
+            timestamp_client=payload.timestamp_client,
+            server_time=checkout_at,
+            ip=client_ip,
+            user_agent=user_agent,
+            accept_language=request.headers.get("accept-language"),
+            ip_geo_lat=_extract_client_ip_geo_lat(request),
+            ip_geo_lng=_extract_client_ip_geo_lng(request),
+            ip_asn=_extract_client_asn_hint(request),
+            ip_proxy_or_vpn=_extract_client_proxy_hint(request),
+            risk_policy_version=settings.RISK_POLICY_VERSION,
+            distance_to_geofence_m=nearest_distance,
+            radius_m=nearest_radius,
+            is_out_of_range=out_of_range,
+            previous_action_time=previous_action.time if previous_action else None,
+            previous_action_lat=previous_action.lat if previous_action else None,
+            previous_action_lng=previous_action.lng if previous_action else None,
+        )
+    )
+    if risk_assessment.decision == "BLOCK":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "LOCATION_RISK_BLOCKED",
+                "message": "Vị trí check-out bị từ chối do rủi ro giả mạo GPS cao.",
+                "details": {
+                    "risk_score": risk_assessment.score,
+                    "risk_level": risk_assessment.level,
+                    "risk_flags": risk_assessment.flags,
+                    "risk_policy_version": risk_assessment.policy_version,
+                    "decision": risk_assessment.decision,
+                    "message": risk_assessment.user_message,
+                },
+            },
+        )
+
+    risk_note = None
+    if risk_assessment.decision != "ALLOW":
+        risk_note = (
+            f"RISK:{risk_assessment.decision};"
+            f"SCORE={risk_assessment.score};"
+            f"FLAGS={','.join(risk_assessment.flags[:6])}"
+        )
 
     log = AttendanceLog(
         employee_id=emp.id,
@@ -765,6 +1070,14 @@ def checkout(payload: LocationRequest, db: Session = Depends(get_db), user: User
         snapshot_cutoff_minutes=open_checkin.snapshot_cutoff_minutes,
         time_rule_source=open_checkin.time_rule_source,
         time_rule_fallback_reason=open_checkin.time_rule_fallback_reason,
+        risk_score=risk_assessment.score,
+        risk_level=risk_assessment.level,
+        risk_flags=_serialize_risk_flags(risk_assessment.flags),
+        risk_policy_version=risk_assessment.policy_version,
+        ip=client_ip,
+        ua_hash=_hash_user_agent(user_agent),
+        accuracy_m=payload.accuracy_m,
+        address_text=risk_note,
     )
 
     db.add(log)
@@ -774,6 +1087,18 @@ def checkout(payload: LocationRequest, db: Session = Depends(get_db), user: User
         db.rollback()
         raise HTTPException(status_code=400, detail="Bạn đã checkout cho ngày công này.")
     db.refresh(log)
+    if risk_assessment.decision == "ALLOW_WITH_EXCEPTION":
+        _ensure_location_risk_exception(
+            db=db,
+            emp=emp,
+            source_checkin_log=open_checkin,
+            risk_score=risk_assessment.score,
+            risk_level=risk_assessment.level,
+            risk_flags=risk_assessment.flags,
+            risk_policy_version=risk_assessment.policy_version,
+            action_type="OUT",
+        )
+        db.commit()
 
     msg = f"Check-out thành công ({checkout_status}) cho ngày công {_format_vn_date(work_date)}."
     if out_of_range:
@@ -785,12 +1110,18 @@ def checkout(payload: LocationRequest, db: Session = Depends(get_db), user: User
         msg = f"Check-out thành công ({checkout_status}) tại geofence: {matched_geofence_name}."
     elif using_fallback_rule:
         msg = f"Check-out thành công ({checkout_status}) theo rule fallback hệ thống ({geofence_fallback_reason})."
+    if risk_assessment.decision == "ALLOW_WITH_EXCEPTION":
+        msg = f"{msg} {risk_assessment.user_message}"
 
     return CheckActionResponse(
         log=_to_log_response(log),
         message=msg,
         geofence_source=geofence_source,
         fallback_reason=geofence_fallback_reason,
+        risk_score=risk_assessment.score,
+        risk_level=risk_assessment.level,
+        risk_flags=risk_assessment.flags,
+        decision=risk_assessment.decision,
     )
 
 
@@ -1034,6 +1365,7 @@ def list_logs_admin(
 
     logs = q.order_by(AttendanceLog.time.desc()).all()
     return [_to_log_response(x) for x in logs]
+
 
 
 

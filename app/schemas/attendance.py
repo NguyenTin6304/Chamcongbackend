@@ -9,14 +9,18 @@ CheckoutStatus = Literal["EARLY", "ON_TIME", "LATE", "NO_CHECKOUT", "SYSTEM_AUTO
 AttendanceState = Literal["COMPLETE", "MISSED_CHECKOUT", "MISSING_CHECKIN_ANOMALY", "ABSENT", "PENDING_TIMESHEET"]
 GeofenceSource = Literal["GROUP", "SYSTEM_FALLBACK"]
 TimeRuleSource = Literal["GROUP", "SYSTEM_FALLBACK"]
-AttendanceExceptionType = Literal["MISSED_CHECKOUT", "AUTO_CLOSED"]
+AttendanceExceptionType = Literal["MISSED_CHECKOUT", "AUTO_CLOSED", "SUSPECTED_LOCATION_SPOOF"]
 AttendanceExceptionStatus = Literal["OPEN", "RESOLVED"]
+LocationRiskDecision = Literal["ALLOW", "ALLOW_WITH_EXCEPTION", "BLOCK"]
+LocationRiskLevel = Literal["LOW", "MEDIUM", "HIGH"]
 
 
 class LocationRequest(BaseModel):
     # Accept both {lat,lng} and {latitude,longitude}
     lat: float = Field(validation_alias=AliasChoices("lat", "latitude"), ge=-90, le=90)
     lng: float = Field(validation_alias=AliasChoices("lng", "longitude"), ge=-180, le=180)
+    accuracy_m: float | None = Field(default=None, gt=0, le=5000)
+    timestamp_client: datetime | None = None
 
 
 class AttendanceLogResponse(BaseModel):
@@ -36,6 +40,13 @@ class AttendanceLogResponse(BaseModel):
     is_out_of_range: bool
     punctuality_status: PunctualityStatus | None = None
     checkout_status: CheckoutStatus | None = None
+    risk_score: int | None = None
+    risk_level: LocationRiskLevel | None = None
+    risk_flags: list[str] = Field(default_factory=list)
+    risk_policy_version: str | None = None
+    ip: str | None = None
+    ua_hash: str | None = None
+    accuracy_m: float | None = None
 
 
 class CheckActionResponse(BaseModel):
@@ -43,6 +54,10 @@ class CheckActionResponse(BaseModel):
     message: str
     geofence_source: GeofenceSource
     fallback_reason: str | None = None
+    risk_score: int
+    risk_level: LocationRiskLevel
+    risk_flags: list[str] = Field(default_factory=list)
+    decision: LocationRiskDecision
 
 
 class AttendanceStatusResponse(BaseModel):
@@ -97,6 +112,11 @@ class AttendanceExceptionReportResponse(BaseModel):
     exception_type: AttendanceExceptionType
     status: AttendanceExceptionStatus
     note: str | None = None
+    resolved_note: str | None = None
+    risk_score: int | None = None
+    risk_level: LocationRiskLevel | None = None
+    risk_flags: list[str] = Field(default_factory=list)
+    risk_policy_version: str | None = None
     source_checkin_log_id: int
     source_checkin_time: datetime | None = None
     actual_checkout_time: datetime | None = None

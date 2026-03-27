@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     RECAPTCHA_EXPECTED_ACTION: str = ""
     # Optional comma-separated hostnames. Example: "localhost,chamcongweb.vercel.app"
     RECAPTCHA_ALLOWED_HOSTNAMES: str = ""
+    RISK_POLICY_VERSION: str = "v1"
 
 
 settings = Settings()
