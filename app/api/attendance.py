@@ -199,6 +199,30 @@ def _last_log(db: Session, employee_id: int) -> AttendanceLog | None:
     )
 
 
+def _count_recent_exact_coordinate_reuse(
+    db: Session,
+    employee_id: int,
+    lat: float,
+    lng: float,
+    *,
+    lookback_days: int = 14,
+    limit: int = 30,
+) -> int:
+    since = datetime.now(timezone.utc) - timedelta(days=max(1, lookback_days))
+    rows = (
+        db.query(AttendanceLog.lat, AttendanceLog.lng)
+        .filter(
+            AttendanceLog.employee_id == employee_id,
+            AttendanceLog.time >= since,
+        )
+        .order_by(AttendanceLog.time.desc())
+        .limit(max(1, limit))
+        .all()
+    )
+    epsilon = 1e-6
+    return sum(1 for row in rows if abs(float(row.lat) - lat) <= epsilon and abs(float(row.lng) - lng) <= epsilon)
+
+
 def _extract_client_ip(request: Request) -> str | None:
     forwarded_for = request.headers.get("x-forwarded-for", "").strip()
     if forwarded_for:
@@ -827,6 +851,12 @@ def checkin(
     client_ip = _extract_client_ip(request)
     user_agent = request.headers.get("user-agent")
     previous_action = _last_log(db, emp.id)
+    recent_exact_coord_reuse_count = _count_recent_exact_coordinate_reuse(
+        db,
+        emp.id,
+        payload.lat,
+        payload.lng,
+    )
     risk_assessment = assess_location_risk(
         LocationRiskInput(
             lat=payload.lat,
@@ -848,6 +878,7 @@ def checkin(
             previous_action_time=previous_action.time if previous_action else None,
             previous_action_lat=previous_action.lat if previous_action else None,
             previous_action_lng=previous_action.lng if previous_action else None,
+            recent_exact_coord_reuse_count=recent_exact_coord_reuse_count,
         )
     )
     if risk_assessment.decision == "BLOCK":
@@ -1002,6 +1033,12 @@ def checkout(
     client_ip = _extract_client_ip(request)
     user_agent = request.headers.get("user-agent")
     previous_action = _last_log(db, emp.id)
+    recent_exact_coord_reuse_count = _count_recent_exact_coordinate_reuse(
+        db,
+        emp.id,
+        payload.lat,
+        payload.lng,
+    )
     risk_assessment = assess_location_risk(
         LocationRiskInput(
             lat=payload.lat,
@@ -1023,6 +1060,7 @@ def checkout(
             previous_action_time=previous_action.time if previous_action else None,
             previous_action_lat=previous_action.lat if previous_action else None,
             previous_action_lng=previous_action.lng if previous_action else None,
+            recent_exact_coord_reuse_count=recent_exact_coord_reuse_count,
         )
     )
     if risk_assessment.decision == "BLOCK":

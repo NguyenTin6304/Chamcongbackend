@@ -26,6 +26,7 @@ def _base_input() -> LocationRiskInput:
         previous_action_time=now - timedelta(minutes=30),
         previous_action_lat=10.77,
         previous_action_lng=106.70,
+        recent_exact_coord_reuse_count=0,
     )
 
 
@@ -102,6 +103,37 @@ class LocationRiskScoringTestCase(unittest.TestCase):
         result = assess_location_risk(payload)
         self.assertEqual(result.score, 100)
         self.assertEqual(result.decision, "BLOCK")
+
+    def test_mobile_web_missing_network_context_is_escalated(self) -> None:
+        base = _base_input()
+        payload = LocationRiskInput(
+            **{
+                **base.__dict__,
+                "user_agent": "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36",
+                "ip_geo_lat": None,
+                "ip_geo_lng": None,
+                "ip_asn": "",
+                "accuracy_m": 5,
+            }
+        )
+        result = assess_location_risk(payload)
+        self.assertGreaterEqual(result.score, 40)
+        self.assertEqual(result.decision, "ALLOW_WITH_EXCEPTION")
+        self.assertIn("MOBILE_WEB_MISSING_NETWORK_CONTEXT", result.flags)
+        self.assertIn("TOO_PERFECT_GPS_WITHOUT_NETWORK_CONTEXT", result.flags)
+
+    def test_exact_coordinate_repeat_pattern_adds_risk(self) -> None:
+        base = _base_input()
+        payload = LocationRiskInput(
+            **{
+                **base.__dict__,
+                "recent_exact_coord_reuse_count": 4,
+                "accuracy_m": 150,
+            }
+        )
+        result = assess_location_risk(payload)
+        self.assertGreaterEqual(result.score, 40)
+        self.assertIn("EXACT_COORD_REPEAT_PATTERN", result.flags)
 
 
 if __name__ == "__main__":

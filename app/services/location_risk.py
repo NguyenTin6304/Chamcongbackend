@@ -29,6 +29,7 @@ class LocationRiskInput:
     previous_action_time: datetime | None
     previous_action_lat: float | None
     previous_action_lng: float | None
+    recent_exact_coord_reuse_count: int
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,14 @@ def _has_browser_spoof_hint(user_agent: str | None, accept_language: str | None)
     if "mozilla/" in ua and not lang:
         return True
     return False
+
+
+def _is_mobile_web_user_agent(user_agent: str | None) -> bool:
+    ua = (user_agent or "").strip().lower()
+    if not ua:
+        return False
+    mobile_tokens = ("mobile", "android", "iphone", "ipad")
+    return any(token in ua for token in mobile_tokens)
 
 
 def _is_datacenter_proxy_vpn_asn(ip_asn: str | None) -> bool:
@@ -130,11 +139,21 @@ def _build_user_message(level: LocationRiskLevel, flags: list[str]) -> str:
 def assess_location_risk(payload: LocationRiskInput) -> LocationRiskAssessment:
     score = 0
     flags: list[str] = []
+    is_mobile_web = _is_mobile_web_user_agent(payload.user_agent)
+    has_network_context = (
+        payload.ip_geo_lat is not None and payload.ip_geo_lng is not None
+    ) or bool((payload.ip_asn or "").strip())
 
     accuracy = payload.accuracy_m
     if accuracy is not None and accuracy > 100:
         score += 20
         flags.append("BAD_ACCURACY")
+    if is_mobile_web and not has_network_context:
+        score += 20
+        flags.append("MOBILE_WEB_MISSING_NETWORK_CONTEXT")
+    if is_mobile_web and not has_network_context and accuracy is not None and accuracy <= 10:
+        score += 20
+        flags.append("TOO_PERFECT_GPS_WITHOUT_NETWORK_CONTEXT")
 
     outside_distance_m = max(0.0, float(payload.distance_to_geofence_m) - max(0, int(payload.radius_m)))
     if outside_distance_m > 1000:
@@ -155,6 +174,10 @@ def assess_location_risk(payload: LocationRiskInput) -> LocationRiskAssessment:
             if speed_kmh > 180:
                 score += 35
                 flags.append("IMPOSSIBLE_SPEED")
+
+    if payload.recent_exact_coord_reuse_count >= 3:
+        score += 20
+        flags.append("EXACT_COORD_REPEAT_PATTERN")
 
     if payload.ip_geo_lat is not None and payload.ip_geo_lng is not None:
         ip_gps_distance_m = haversine_m(payload.ip_geo_lat, payload.ip_geo_lng, payload.lat, payload.lng)
