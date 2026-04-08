@@ -4,9 +4,9 @@ import json
 from typing import NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import case, func
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.core.config import settings
 from app.core.db import get_db
@@ -20,10 +20,18 @@ from app.services.attendance_time import (
     classify_checkout_status,
     compute_work_date,
     split_regular_overtime_minutes,
-    to_vn_time,
     work_date_cutoff_utc,
 )
 from app.services.geo import haversine_m
+from app.services.attendance_exception_workflow import (
+    can_transition_exception_status,
+    default_exception_status_for_type,
+    ensure_allowed_exception_transition,
+    is_pending_exception_status,
+    is_pending_timesheet_exception,
+    is_terminal_exception_status,
+    normalize_exception_status,
+)
 from app.services.location_risk import LocationRiskInput, assess_location_risk
 from app.services.report_consistency import (
     compute_distance_consistency_warning,
@@ -319,10 +327,30 @@ def _deserialize_risk_flags(raw: str | None) -> list[str]:
 
 
 def _get_open_session_checkin(db: Session, employee_id: int) -> AttendanceLog | None:
-    last = _last_log(db, employee_id)
-    if last and last.type == "IN":
-        return last
-    return None
+    checkin_log = aliased(AttendanceLog)
+    checkout_log = aliased(AttendanceLog)
+    work_date_matches = or_(
+        checkout_log.work_date == checkin_log.work_date,
+        and_(checkout_log.work_date.is_(None), checkin_log.work_date.is_(None)),
+    )
+    return (
+        db.query(checkin_log)
+        .outerjoin(
+            checkout_log,
+            and_(
+                checkout_log.employee_id == checkin_log.employee_id,
+                checkout_log.type == "OUT",
+                work_date_matches,
+            ),
+        )
+        .filter(
+            checkin_log.employee_id == employee_id,
+            checkin_log.type == "IN",
+            checkout_log.id.is_(None),
+        )
+        .order_by(checkin_log.time.desc())
+        .first()
+    )
 
 
 def _format_vn_date(value: date) -> str:
@@ -355,15 +383,22 @@ def _ensure_auto_closed_exception(db: Session, emp: Employee, source_checkin_log
                 source_checkin_log_id=source_checkin_log.id,
                 exception_type="AUTO_CLOSED",
                 work_date=work_date,
-                status="OPEN",
+                status=default_exception_status_for_type("AUTO_CLOSED"),
                 note="System auto closed session at cross-day cutoff",
             )
         )
         return
 
+    if is_terminal_exception_status(existing.status):
+        return
+
     existing.exception_type = "AUTO_CLOSED"
     existing.work_date = work_date
-    existing.status = "OPEN"
+    current_status = normalize_exception_status(existing.status)
+    target_status = default_exception_status_for_type("AUTO_CLOSED")
+    existing.status = current_status or target_status
+    if current_status != target_status and can_transition_exception_status(current_status, target_status):
+        existing.status = ensure_allowed_exception_transition(current_status, target_status)
     existing.note = "System auto closed session at cross-day cutoff"
     existing.resolved_note = None
 
@@ -388,7 +423,7 @@ def _ensure_missed_checkout_exception(
                 source_checkin_log_id=source_checkin_log.id,
                 exception_type="MISSED_CHECKOUT",
                 work_date=work_date,
-                status="OPEN",
+                status=default_exception_status_for_type("MISSED_CHECKOUT"),
                 note=default_note,
             )
         )
@@ -398,6 +433,9 @@ def _ensure_missed_checkout_exception(
     if existing.exception_type == "AUTO_CLOSED":
         return False
 
+    if is_terminal_exception_status(existing.status):
+        return False
+
     changed = False
     if existing.exception_type != "MISSED_CHECKOUT":
         existing.exception_type = "MISSED_CHECKOUT"
@@ -405,8 +443,10 @@ def _ensure_missed_checkout_exception(
     if existing.work_date != work_date:
         existing.work_date = work_date
         changed = True
-    if existing.status != "OPEN":
-        existing.status = "OPEN"
+    target_status = default_exception_status_for_type("MISSED_CHECKOUT")
+    current_status = normalize_exception_status(existing.status)
+    if current_status != target_status and can_transition_exception_status(current_status, target_status):
+        existing.status = ensure_allowed_exception_transition(current_status, target_status)
         existing.resolved_by = None
         existing.resolved_at = None
         existing.resolved_note = None
@@ -448,7 +488,7 @@ def _ensure_location_risk_exception(
                     source_checkin_log.time,
                     source_checkin_log.snapshot_cutoff_minutes or DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
                 ),
-                status="OPEN",
+                status=default_exception_status_for_type("SUSPECTED_LOCATION_SPOOF"),
                 note=note,
                 resolved_note=None,
             )
@@ -463,12 +503,69 @@ def _ensure_location_risk_exception(
             existing.note = note
         return
 
+    if is_terminal_exception_status(existing.status):
+        return
+
     existing.exception_type = "SUSPECTED_LOCATION_SPOOF"
-    existing.status = "OPEN"
+    current_status = normalize_exception_status(existing.status)
+    target_status = default_exception_status_for_type("SUSPECTED_LOCATION_SPOOF")
+    existing.status = current_status or target_status
+    if current_status != target_status and can_transition_exception_status(current_status, target_status):
+        existing.status = ensure_allowed_exception_transition(current_status, target_status)
     existing.note = note
     existing.resolved_note = None
     existing.resolved_by = None
     existing.resolved_at = None
+
+
+def _ensure_large_time_deviation_exception(
+    db: Session,
+    emp: Employee,
+    source_checkin_log: AttendanceLog,
+    deviation_seconds: float,
+    action_type: str,
+) -> None:
+    existing = (
+        db.query(AttendanceException)
+        .filter(AttendanceException.source_checkin_log_id == source_checkin_log.id)
+        .first()
+    )
+    note = (
+        f"Large time deviation detected on {action_type}: "
+        f"client timestamp differs from server by {abs(deviation_seconds):.0f}s "
+        f"({abs(deviation_seconds) / 60:.1f} min)"
+    )
+
+    if existing is None:
+        db.add(
+            AttendanceException(
+                employee_id=emp.id,
+                source_checkin_log_id=source_checkin_log.id,
+                exception_type="LARGE_TIME_DEVIATION",
+                work_date=source_checkin_log.work_date
+                or compute_work_date(
+                    source_checkin_log.time,
+                    source_checkin_log.snapshot_cutoff_minutes or DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
+                ),
+                status=default_exception_status_for_type("LARGE_TIME_DEVIATION"),
+                note=note,
+            )
+        )
+        return
+
+    if is_terminal_exception_status(existing.status):
+        return
+
+    # Higher-priority types keep their exception_type; append note only.
+    if existing.exception_type in {"AUTO_CLOSED", "MISSED_CHECKOUT", "SUSPECTED_LOCATION_SPOOF"}:
+        if existing.note and "Large time deviation" not in existing.note:
+            existing.note = f"{existing.note} | {note}"
+        elif not existing.note:
+            existing.note = note
+        return
+
+    # Existing LARGE_TIME_DEVIATION — refresh note.
+    existing.note = note
 
 
 def _missed_checkout_threshold_utc(open_checkin: AttendanceLog) -> datetime:
@@ -686,8 +783,9 @@ def _build_exception_map(
     for row in q.all():
         key = (row.employee_id, row.work_date)
         current = status_map.get(key)
-        if current is None or current[0] != "OPEN":
-            status_map[key] = (row.status, row.exception_type)
+        normalized_status = normalize_exception_status(row.status)
+        if current is None or not is_pending_exception_status(current[0]):
+            status_map[key] = (normalized_status, row.exception_type)
     return status_map
 
 
@@ -696,7 +794,7 @@ def _apply_exception_to_attendance_state(
     exception_status: str | None,
     exception_type: str | None,
 ) -> str:
-    if exception_status == "OPEN" and exception_type in {"AUTO_CLOSED", "MISSED_CHECKOUT"}:
+    if is_pending_timesheet_exception(exception_status, exception_type):
         return "PENDING_TIMESHEET"
     return attendance_state
 
@@ -708,7 +806,7 @@ def _compute_payable_overtime_minutes(
 ) -> int | None:
     if overtime_minutes is None:
         return None
-    if exception_status == "OPEN" and exception_type in {"AUTO_CLOSED", "MISSED_CHECKOUT"}:
+    if is_pending_timesheet_exception(exception_status, exception_type):
         return 0
     return overtime_minutes
 
@@ -956,6 +1054,18 @@ def checkin(
         )
         db.commit()
 
+    if payload.timestamp_client is not None:
+        deviation_sec = (checkin_at - payload.timestamp_client).total_seconds()
+        if abs(deviation_sec) > settings.LARGE_TIME_DEVIATION_THRESHOLD_MINUTES * 60:
+            _ensure_large_time_deviation_exception(
+                db=db,
+                emp=emp,
+                source_checkin_log=log,
+                deviation_seconds=deviation_sec,
+                action_type="IN",
+            )
+            db.commit()
+
     msg = f"Check-in thành công ({punctuality_status}) cho ngày công {_format_vn_date(work_date)}."
     if out_of_range:
         msg = (
@@ -1137,6 +1247,18 @@ def checkout(
             action_type="OUT",
         )
         db.commit()
+
+    if payload.timestamp_client is not None:
+        deviation_sec = (checkout_at - payload.timestamp_client).total_seconds()
+        if abs(deviation_sec) > settings.LARGE_TIME_DEVIATION_THRESHOLD_MINUTES * 60:
+            _ensure_large_time_deviation_exception(
+                db=db,
+                emp=emp,
+                source_checkin_log=open_checkin,
+                deviation_seconds=deviation_sec,
+                action_type="OUT",
+            )
+            db.commit()
 
     msg = f"Check-out thành công ({checkout_status}) cho ngày công {_format_vn_date(work_date)}."
     if out_of_range:
@@ -1403,11 +1525,4 @@ def list_logs_admin(
 
     logs = q.order_by(AttendanceLog.time.desc()).all()
     return [_to_log_response(x) for x in logs]
-
-
-
-
-
-
-
 

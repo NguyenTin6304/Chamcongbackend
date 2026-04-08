@@ -9,8 +9,14 @@ CheckoutStatus = Literal["EARLY", "ON_TIME", "LATE", "NO_CHECKOUT", "SYSTEM_AUTO
 AttendanceState = Literal["COMPLETE", "MISSED_CHECKOUT", "MISSING_CHECKIN_ANOMALY", "ABSENT", "PENDING_TIMESHEET"]
 GeofenceSource = Literal["GROUP", "SYSTEM_FALLBACK"]
 TimeRuleSource = Literal["GROUP", "SYSTEM_FALLBACK"]
-AttendanceExceptionType = Literal["MISSED_CHECKOUT", "AUTO_CLOSED", "SUSPECTED_LOCATION_SPOOF"]
-AttendanceExceptionStatus = Literal["OPEN", "RESOLVED"]
+AttendanceExceptionType = Literal["MISSED_CHECKOUT", "AUTO_CLOSED", "SUSPECTED_LOCATION_SPOOF", "LARGE_TIME_DEVIATION"]
+AttendanceExceptionStatus = Literal[
+    "PENDING_EMPLOYEE",
+    "PENDING_ADMIN",
+    "APPROVED",
+    "REJECTED",
+    "EXPIRED",
+]
 LocationRiskDecision = Literal["ALLOW", "ALLOW_WITH_EXCEPTION", "BLOCK"]
 LocationRiskLevel = Literal["LOW", "MEDIUM", "HIGH"]
 
@@ -119,11 +125,38 @@ class AttendanceExceptionReportResponse(BaseModel):
     risk_policy_version: str | None = None
     source_checkin_log_id: int
     source_checkin_time: datetime | None = None
+    detected_at: datetime | None = None
+    expires_at: datetime | None = None
+    employee_explanation: str | None = None
+    employee_submitted_at: datetime | None = None
+    admin_note: str | None = None
+    admin_decided_at: datetime | None = None
+    decided_by: int | None = None
+    decided_by_email: str | None = None
     actual_checkout_time: datetime | None = None
     created_at: datetime | None = None
     resolved_at: datetime | None = None
     resolved_by: int | None = None
     resolved_by_email: str | None = None
+    can_submit_explanation: bool = False
+    can_admin_decide: bool = False
+    can_expire: bool = False
+
+
+class AttendanceExceptionAuditResponse(BaseModel):
+    id: int
+    event_type: str
+    previous_status: AttendanceExceptionStatus | None = None
+    next_status: AttendanceExceptionStatus
+    actor_type: str
+    actor_id: int | None = None
+    actor_email: str | None = None
+    metadata: dict[str, object] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class AttendanceExceptionDetailResponse(AttendanceExceptionReportResponse):
+    timeline: list[AttendanceExceptionAuditResponse] = Field(default_factory=list)
 
 
 class AttendanceExceptionResolveRequest(BaseModel):
@@ -133,3 +166,26 @@ class AttendanceExceptionResolveRequest(BaseModel):
 
 class AttendanceExceptionReopenRequest(BaseModel):
     note: str | None = Field(default=None, max_length=1000)
+
+
+class AttendanceExceptionCreateRequest(BaseModel):
+    employee_id: int
+    source_checkin_log_id: int
+    exception_type: AttendanceExceptionType
+    work_date: date | None = None
+    note: str | None = Field(default=None, max_length=2000)
+    detected_at: datetime | None = None
+    expires_at: datetime | None = None
+
+
+class AttendanceExceptionSubmitExplanationRequest(BaseModel):
+    explanation: str = Field(min_length=1, max_length=2000)
+
+
+class AttendanceExceptionApproveRequest(BaseModel):
+    admin_note: str | None = Field(default=None, max_length=2000)
+    actual_checkout_time: datetime | None = None
+
+
+class AttendanceExceptionRejectRequest(BaseModel):
+    admin_note: str = Field(min_length=1, max_length=2000)

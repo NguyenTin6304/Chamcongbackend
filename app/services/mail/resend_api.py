@@ -3,8 +3,11 @@ import socket
 import time
 from urllib import error, request
 
-from app.services.mail.base import MailSender, ResetPasswordMail
+from app.services.mail.base import ExceptionNotificationMail, MailSender, ResetPasswordMail
 from app.services.mail.templates import (
+    build_exception_notification_html,
+    build_exception_notification_subject,
+    build_exception_notification_text,
     build_reset_password_html,
     build_reset_password_subject,
     build_reset_password_text,
@@ -29,7 +32,7 @@ class ResendMailSender(MailSender):
         self._retry_attempts = max(1, int(retry_attempts))
         self._retry_delay_sec = max(0.0, float(retry_delay_sec))
 
-    def send_reset_password(self, payload: ResetPasswordMail) -> None:
+    def _send(self, *, to_email: str, subject: str, text: str, html: str) -> None:
         if not self._api_key:
             raise RuntimeError("RESEND_API_KEY is empty")
         if not self._mail_from:
@@ -37,10 +40,10 @@ class ResendMailSender(MailSender):
 
         body = {
             "from": self._mail_from,
-            "to": [payload.to_email],
-            "subject": build_reset_password_subject(),
-            "text": build_reset_password_text(payload),
-            "html": build_reset_password_html(payload),
+            "to": [to_email],
+            "subject": subject,
+            "text": text,
+            "html": html,
         }
         data = json.dumps(body).encode("utf-8")
 
@@ -84,3 +87,19 @@ class ResendMailSender(MailSender):
                     detail = f"{detail} - {last_http_body}"
                 raise RuntimeError(detail) from last_error
             raise RuntimeError(f"Resend API unreachable: {last_error}") from last_error
+
+    def send_reset_password(self, payload: ResetPasswordMail) -> None:
+        self._send(
+            to_email=payload.to_email,
+            subject=build_reset_password_subject(),
+            text=build_reset_password_text(payload),
+            html=build_reset_password_html(payload),
+        )
+
+    def send_exception_notification(self, payload: ExceptionNotificationMail) -> None:
+        self._send(
+            to_email=payload.to_email,
+            subject=build_exception_notification_subject(payload.event_type),
+            text=build_exception_notification_text(payload),
+            html=build_exception_notification_html(payload),
+        )

@@ -10,6 +10,7 @@ from app.schemas.employees import (
     EmployeeAssignUserRequest,
     EmployeeCreateRequest,
     EmployeeResponse,
+    EmployeeUpdateRequest,
 )
 
 router = APIRouter(prefix="/employees", tags=["employees"])
@@ -92,6 +93,36 @@ def my_employee_profile(
     emp = db.query(Employee).filter(Employee.user_id == user.id).first()
     if not emp:
         raise HTTPException(status_code=404, detail="Ban chua duoc gan Employee")
+    return emp
+
+
+@router.put("/{employee_id}", response_model=EmployeeResponse)
+def update_employee(
+    employee_id: int,
+    payload: EmployeeUpdateRequest,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    emp = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    if payload.full_name is not None:
+        name = payload.full_name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="full_name khong duoc de trong")
+        emp.full_name = name
+
+    if "user_id" in payload.model_fields_set:
+        _validate_user_mapping(db, employee_id=employee_id, user_id=payload.user_id)
+        emp.user_id = payload.user_id
+
+    if "group_id" in payload.model_fields_set:
+        _validate_group_exists(db, payload.group_id)
+        emp.group_id = payload.group_id
+
+    db.commit()
+    db.refresh(emp)
     return emp
 
 

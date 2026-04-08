@@ -1,7 +1,7 @@
-import logging
+﻿import logging
 
 from app.core.config import settings
-from app.services.mail.base import MailSender, ResetPasswordMail
+from app.services.mail.base import ExceptionNotificationMail, MailSender, ResetPasswordMail
 from app.services.mail.http_sender import HttpMailSender
 from app.services.mail.noop import NoopMailSender
 from app.services.mail.resend_api import ResendMailSender
@@ -27,6 +27,25 @@ class FallbackMailSender(MailSender):
                 self._fallback.send_reset_password(payload)
             except Exception:
                 logger.exception("Fallback mail sender also failed. to=%s", payload.to_email)
+                raise primary_error
+
+    def send_exception_notification(self, payload: ExceptionNotificationMail) -> None:
+        try:
+            self._primary.send_exception_notification(payload)
+        except Exception as primary_error:
+            logger.exception(
+                "Primary mail sender failed. Switching to fallback sender. event=%s to=%s",
+                payload.event_type,
+                payload.to_email,
+            )
+            try:
+                self._fallback.send_exception_notification(payload)
+            except Exception:
+                logger.exception(
+                    "Fallback mail sender also failed. event=%s to=%s",
+                    payload.event_type,
+                    payload.to_email,
+                )
                 raise primary_error
 
 

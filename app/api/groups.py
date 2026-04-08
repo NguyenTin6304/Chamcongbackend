@@ -93,6 +93,44 @@ def list_groups(
     return query.order_by(Group.id.asc()).all()
 
 
+@router.get("/geofences/summary")
+def list_all_geofences_by_group(
+    group_ids: str | None = None,
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+) -> dict:
+    """Aggregate endpoint: fetch all group geofences in one query.
+
+    Returns a JSON object keyed by group_id (as string) mapping to a list of
+    geofence objects, e.g. ``{"1": [...], "2": [...]}``.
+
+    Query params:
+      - group_ids: optional comma-separated group IDs to filter (e.g. "1,2,3")
+      - active_only: if true, only include active geofences
+    """
+    query = db.query(GroupGeofence)
+    if group_ids:
+        ids = [int(x) for x in group_ids.split(",") if x.strip().isdigit()]
+        if ids:
+            query = query.filter(GroupGeofence.group_id.in_(ids))
+    if active_only:
+        query = query.filter(GroupGeofence.active.is_(True))
+
+    geofences = query.order_by(
+        GroupGeofence.group_id.asc(),
+        GroupGeofence.id.asc(),
+    ).all()
+
+    result: dict[str, list] = {}
+    for gf in geofences:
+        key = str(gf.group_id)
+        if key not in result:
+            result[key] = []
+        result[key].append(_to_geofence_response(gf))
+    return result
+
+
 @router.put("/{group_id}", response_model=GroupResponse)
 def update_group(
     group_id: int,

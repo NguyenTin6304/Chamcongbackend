@@ -158,10 +158,55 @@ class AttendanceException(Base):
     source_checkin_log_id = Column(Integer, ForeignKey("attendance_logs.id"), nullable=False, unique=True)
     exception_type = Column(String(50), nullable=False, index=True)  # MISSED_CHECKOUT/AUTO_CLOSED/SUSPECTED_LOCATION_SPOOF
     work_date = Column(Date, nullable=False)
-    status = Column(String(20), nullable=False, default="OPEN")  # OPEN/RESOLVED
+    # Workflow status is normalized by the Phase 2 migration/validator.
+    status = Column(String(20), nullable=False, default="PENDING_EMPLOYEE")
+    detected_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    employee_explanation = Column(Text, nullable=True)
+    employee_submitted_at = Column(DateTime(timezone=True), nullable=True)
+    admin_note = Column(Text, nullable=True)
+    admin_decided_at = Column(DateTime(timezone=True), nullable=True)
+    decided_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     note = Column(Text, nullable=True)
     resolved_note = Column(Text, nullable=True)
     actual_checkout_time = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     resolved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     resolved_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class AttendanceExceptionAudit(Base):
+    __tablename__ = "attendance_exception_audits"
+
+    id = Column(Integer, primary_key=True)
+    exception_id = Column(Integer, ForeignKey("attendance_exceptions.id", ondelete="CASCADE"), nullable=False, index=True)
+    event_type = Column(String(64), nullable=False, index=True)
+    previous_status = Column(String(20), nullable=True)
+    next_status = Column(String(20), nullable=False)
+    actor_type = Column(String(20), nullable=False)
+    actor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    actor_email = Column(String(255), nullable=True)
+    metadata_json = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class AttendanceExceptionNotification(Base):
+    __tablename__ = "attendance_exception_notifications"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_attendance_exception_notifications_dedupe_key"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    exception_id = Column(Integer, ForeignKey("attendance_exceptions.id", ondelete="CASCADE"), nullable=False, index=True)
+    event_type = Column(String(64), nullable=False, index=True)
+    recipient_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    recipient_email = Column(String(255), nullable=False)
+    recipient_role = Column(String(20), nullable=False)
+    dedupe_key = Column(String(160), nullable=False)
+    status = Column(String(20), nullable=False, default="QUEUED")
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+    failed_at = Column(DateTime(timezone=True), nullable=True)
+    error_message = Column(Text, nullable=True)
+    metadata_json = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+

@@ -38,3 +38,7 @@ dist/
 Thumbs.db
 
 AGENTS.md
+CLAUDE.md
+CODEBASE_OVERVIEW.md
+.claude
+docs

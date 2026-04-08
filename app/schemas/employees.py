@@ -18,6 +18,12 @@ class EmployeeAssignGroupRequest(BaseModel):
     group_id: Optional[int] = None
 
 
+class EmployeeUpdateRequest(BaseModel):
+    full_name: Optional[str] = None
+    group_id: Optional[int] = None
+    user_id: Optional[int] = None
+
+
 class EmployeeResponse(BaseModel):
     id: int
     code: str

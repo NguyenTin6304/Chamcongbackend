@@ -1,7 +1,8 @@
-﻿from fastapi import Depends, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.db import get_db
 from app.core.security import decode_access_token
 from app.models import User
@@ -33,3 +34,17 @@ def require_admin(current_user: User = Depends(get_current_user)) -> User:
     if current_user.role != "ADMIN":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
     return current_user
+
+
+def require_exception_workflow_system(
+    system_key: str | None = Header(default=None, alias="X-Exception-Workflow-Key"),
+) -> str:
+    expected_key = settings.EXCEPTION_WORKFLOW_SYSTEM_KEY.strip()
+    if not expected_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Exception workflow system key is not configured",
+        )
+    if system_key != expected_key:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="System actor only")
+    return "SYSTEM"

@@ -1,4 +1,4 @@
-﻿from app.services.mail.base import MailSender, ResetPasswordMail
+﻿from app.services.mail.base import ExceptionNotificationMail, MailSender, ResetPasswordMail
 
 
 class NoopMailSender(MailSender):
@@ -7,4 +7,10 @@ class NoopMailSender(MailSender):
         print(
             "[MAIL_DISABLED] reset password email skipped "
             f"to={payload.to_email} expires={payload.expires_minutes}m url={payload.reset_url}"
+        )
+
+    def send_exception_notification(self, payload: ExceptionNotificationMail) -> None:
+        print(
+            "[MAIL_DISABLED] exception notification skipped "
+            f"event={payload.event_type} to={payload.to_email}"
         )

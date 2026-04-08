@@ -5,8 +5,11 @@ import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-from app.services.mail.base import MailSender, ResetPasswordMail
+from app.services.mail.base import ExceptionNotificationMail, MailSender, ResetPasswordMail
 from app.services.mail.templates import (
+    build_exception_notification_html,
+    build_exception_notification_subject,
+    build_exception_notification_text,
     build_reset_password_html,
     build_reset_password_subject,
     build_reset_password_text,
@@ -37,13 +40,13 @@ class ZohoSmtpMailSender(MailSender):
         self._retry_attempts = max(1, int(retry_attempts))
         self._retry_delay_sec = max(0.0, float(retry_delay_sec))
 
-    def send_reset_password(self, payload: ResetPasswordMail) -> None:
+    def _send(self, *, to_email: str, subject: str, text: str, html: str) -> None:
         msg = MIMEMultipart("alternative")
         msg["From"] = self._mail_from
-        msg["To"] = payload.to_email
-        msg["Subject"] = build_reset_password_subject()
-        msg.attach(MIMEText(build_reset_password_text(payload), "plain", "utf-8"))
-        msg.attach(MIMEText(build_reset_password_html(payload), "html", "utf-8"))
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(text, "plain", "utf-8"))
+        msg.attach(MIMEText(html, "html", "utf-8"))
 
         context = ssl.create_default_context()
         last_error: Exception | None = None
@@ -56,7 +59,7 @@ class ZohoSmtpMailSender(MailSender):
                         server.starttls(context=context)
                         server.ehlo()
                     server.login(self._username, self._password)
-                    server.sendmail(self._mail_from, payload.to_email, msg.as_string())
+                    server.sendmail(self._mail_from, to_email, msg.as_string())
                 return
             except (TimeoutError, socket.timeout, OSError, smtplib.SMTPException) as exc:
                 last_error = exc
@@ -65,3 +68,19 @@ class ZohoSmtpMailSender(MailSender):
 
         if last_error is not None:
             raise last_error
+
+    def send_reset_password(self, payload: ResetPasswordMail) -> None:
+        self._send(
+            to_email=payload.to_email,
+            subject=build_reset_password_subject(),
+            text=build_reset_password_text(payload),
+            html=build_reset_password_html(payload),
+        )
+
+    def send_exception_notification(self, payload: ExceptionNotificationMail) -> None:
+        self._send(
+            to_email=payload.to_email,
+            subject=build_exception_notification_subject(payload.event_type),
+            text=build_exception_notification_text(payload),
+            html=build_exception_notification_html(payload),
+        )

@@ -11,6 +11,7 @@ os.environ["DATABASE_URL"] = "sqlite+pysqlite:///./test_minimum_flows.db"
 os.environ.setdefault("SECRET_KEY", "test-secret-key-at-least-16")
 os.environ.setdefault("ALGORITHM", "HS256")
 os.environ.setdefault("ACCESS_TOKEN_EXPIRE_MINUTES", "60")
+os.environ.setdefault("EXCEPTION_WORKFLOW_SYSTEM_KEY", "test-exception-system-key")
 
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
@@ -18,12 +19,13 @@ from fastapi import HTTPException
 from sqlalchemy import event
 
 from app.core.db import Base, SessionLocal, engine
-from app.core.security import hash_password, hash_token
+from app.core.security import create_access_token, hash_password, hash_token
 from app.main import app
 from app.api import attendance as attendance_api
-from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, PasswordResetToken, RefreshToken, User
+from app.models import AttendanceException, AttendanceExceptionAudit, AttendanceExceptionNotification, AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, PasswordResetToken, RefreshToken, User
 from app.schemas.attendance import LocationRequest
 from app.services.auth.password_reset_service import PasswordResetService, cleanup_password_reset_tokens
+from app.services.attendance_exception_jobs import expire_overdue_exceptions, send_expire_reminders
 
 
 class _BoolOr:
@@ -56,6 +58,9 @@ class _SpyMailSender:
     def send_reset_password(self, payload) -> None:
         self.sent.append(payload)
 
+    def send_exception_notification(self, payload) -> None:
+        self.sent.append(payload)
+
 
 @event.listens_for(engine, "connect")
 def _register_sqlite_bool_or(dbapi_connection, _connection_record) -> None:
@@ -83,6 +88,8 @@ class MinimumFlowsTestCase(unittest.TestCase):
 
     def setUp(self) -> None:
         with SessionLocal() as db:
+            db.query(AttendanceExceptionNotification).delete()
+            db.query(AttendanceExceptionAudit).delete()
             db.query(AttendanceException).delete()
             db.query(AttendanceLog).delete()
             db.query(RefreshToken).delete()
@@ -208,6 +215,34 @@ class MinimumFlowsTestCase(unittest.TestCase):
 
     def _login(self, email: str, password: str) -> str:
         return self._login_tokens(email, password)["access_token"]
+
+    def _system_headers(self) -> dict[str, str]:
+        return {"X-Exception-Workflow-Key": "test-exception-system-key"}
+
+    def _create_attendance_log(
+        self,
+        *,
+        employee_id: int,
+        work_date_value: date,
+        happened_at: datetime,
+        log_type: str = "IN",
+    ) -> AttendanceLog:
+        with SessionLocal() as db:
+            log = AttendanceLog(
+                employee_id=employee_id,
+                type=log_type,
+                time=happened_at,
+                work_date=work_date_value,
+                lat=10.7769,
+                lng=106.7009,
+                is_out_of_range=False,
+                punctuality_status="ON_TIME" if log_type == "IN" else None,
+                checkout_status="ON_TIME" if log_type == "OUT" else None,
+            )
+            db.add(log)
+            db.commit()
+            db.refresh(log)
+            return log
 
     def _request_forgot_password(
         self,
@@ -725,6 +760,75 @@ class MinimumFlowsTestCase(unittest.TestCase):
         self.assertEqual(checkout_res.json()["geofence_source"], "GROUP")
         self.assertIsNone(checkout_res.json()["fallback_reason"])
 
+    def test_out_of_range_gps_risk_creates_suspected_spoof_exception_once(self) -> None:
+        admin = self._create_user(email="admin_gps_risk@example.com", password="admin123", role="ADMIN")
+        user = self._create_user(email="gps_risk_user@example.com", password="user123", role="USER")
+
+        group = self._create_group("GPSR", "GPS Risk Group")
+        self._create_geofence(group.id, "Office Gate", 10.7769, 106.7009, 200)
+        employee = self._create_employee(code="EMGPS", full_name="GPS Risk User", user_id=user.id, group_id=group.id)
+        self._create_rule(latitude=10.7769, longitude=106.7009, radius_m=300)
+
+        user_headers = {"Authorization": f"Bearer {create_access_token({'sub': str(user.id), 'role': user.role})}"}
+        admin_headers = {"Authorization": f"Bearer {create_access_token({'sub': str(admin.id), 'role': admin.role})}"}
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 12, 1, 0, tzinfo=timezone.utc)
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            checkin_res = self.client.post(
+                "/attendance/checkin",
+                headers=user_headers,
+                json={"lat": 10.7905, "lng": 106.5950},
+            )
+        self.assertEqual(checkin_res.status_code, 200, checkin_res.text)
+        self.assertTrue(checkin_res.json()["log"]["is_out_of_range"])
+        self.assertEqual(checkin_res.json()["decision"], "ALLOW_WITH_EXCEPTION")
+
+        employee_exceptions_res = self.client.get(
+            "/reports/attendance-exceptions/me?status=PENDING_EMPLOYEE",
+            headers=user_headers,
+        )
+        self.assertEqual(employee_exceptions_res.status_code, 200, employee_exceptions_res.text)
+        employee_rows = [
+            row for row in employee_exceptions_res.json()
+            if row["employee_code"] == "EMGPS"
+        ]
+        self.assertEqual(len(employee_rows), 1)
+        self.assertEqual(employee_rows[0]["exception_type"], "SUSPECTED_LOCATION_SPOOF")
+        self.assertEqual(employee_rows[0]["status"], "PENDING_EMPLOYEE")
+
+        admin_exceptions_res = self.client.get(
+            "/reports/attendance-exceptions?from=2026-03-12&to=2026-03-12&exception_type=SUSPECTED_LOCATION_SPOOF&status=PENDING_EMPLOYEE",
+            headers=admin_headers,
+        )
+        self.assertEqual(admin_exceptions_res.status_code, 200, admin_exceptions_res.text)
+        admin_rows = [
+            row for row in admin_exceptions_res.json()
+            if row["employee_code"] == "EMGPS"
+        ]
+        self.assertEqual(len(admin_rows), 1)
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 12, 10, 0, tzinfo=timezone.utc)
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            checkout_res = self.client.post(
+                "/attendance/checkout",
+                headers=user_headers,
+                json={"lat": 10.7905, "lng": 106.5950},
+            )
+        self.assertEqual(checkout_res.status_code, 200, checkout_res.text)
+        self.assertEqual(checkout_res.json()["decision"], "ALLOW_WITH_EXCEPTION")
+
+        with SessionLocal() as db:
+            exceptions = (
+                db.query(AttendanceException)
+                .filter(AttendanceException.employee_id == employee.id)
+                .all()
+            )
+        self.assertEqual(len(exceptions), 1)
+        self.assertEqual(exceptions[0].exception_type, "SUSPECTED_LOCATION_SPOOF")
+        self.assertEqual(exceptions[0].status, "PENDING_EMPLOYEE")
+
+        _FixedDateTime.fixed_now = None
+
     def test_group_time_rule_overrides_system_rule(self) -> None:
         user = self._create_user(email="group_time_user@example.com", password="user123", role="USER")
         group = self._create_group(
@@ -1037,7 +1141,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
         self.assertEqual(daily_report_res.status_code, 200, daily_report_res.text)
         daily_rows = daily_report_res.json()
         row = next(r for r in daily_rows if r["employee_code"] == "EM011")
-        self.assertEqual(row["exception_status"], "OPEN")
+        self.assertEqual(row["exception_status"], "PENDING_EMPLOYEE")
         self.assertEqual(row["attendance_state"], "PENDING_TIMESHEET")
         self.assertEqual(row["checkout_status"], "SYSTEM_AUTO")
         self.assertGreater(row["overtime_minutes"], 0)
@@ -1045,7 +1149,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
 
         _FixedDateTime.fixed_now = None
 
-    def test_missed_checkout_auto_exception_resolve_and_reopen(self) -> None:
+    def test_missed_checkout_auto_exception_approve_and_block_reopen(self) -> None:
         admin = self._create_user(email="admin_missed@example.com", password="admin123", role="ADMIN")
         user = self._create_user(email="missed_user@example.com", password="user123", role="USER")
 
@@ -1093,27 +1197,40 @@ class MinimumFlowsTestCase(unittest.TestCase):
         self.assertTrue(rows)
         exception_id = rows[0]["id"]
 
-        resolve_missing_time_res = self.client.patch(
-            f"/reports/attendance-exceptions/{exception_id}/resolve",
+        resolve_missing_time_res = self.client.post(
+            f"/reports/attendance-exceptions/{exception_id}/approve",
             headers=admin_headers,
-            json={"note": "Try resolve without actual time"},
+            json={},
         )
-        self.assertEqual(resolve_missing_time_res.status_code, 400, resolve_missing_time_res.text)
-        self.assertIn("actual_checkout_time is required", resolve_missing_time_res.text)
+        self.assertEqual(resolve_missing_time_res.status_code, 409, resolve_missing_time_res.text)
 
-        resolve_ok_res = self.client.patch(
-            f"/reports/attendance-exceptions/{exception_id}/resolve",
+        submit_explanation_res = self.client.post(
+            f"/reports/attendance-exceptions/{exception_id}/submit-explanation",
+            headers=headers,
+            json={"explanation": "Quen bam checkout sau khi roi cong ty"},
+        )
+        self.assertEqual(submit_explanation_res.status_code, 200, submit_explanation_res.text)
+        submitted = submit_explanation_res.json()
+        self.assertEqual(submitted["status"], "PENDING_ADMIN")
+        self.assertEqual(
+            submitted["employee_explanation"],
+            "Quen bam checkout sau khi roi cong ty",
+        )
+
+        approve_ok_res = self.client.post(
+            f"/reports/attendance-exceptions/{exception_id}/approve",
             headers=admin_headers,
             json={
-                "note": "Admin entered actual checkout",
+                "admin_note": "Admin entered actual checkout",
                 "actual_checkout_time": "2026-03-10T10:30:00+00:00",
             },
         )
-        self.assertEqual(resolve_ok_res.status_code, 200, resolve_ok_res.text)
-        resolved = resolve_ok_res.json()
-        self.assertEqual(resolved["status"], "RESOLVED")
+        self.assertEqual(approve_ok_res.status_code, 200, approve_ok_res.text)
+        resolved = approve_ok_res.json()
+        self.assertEqual(resolved["status"], "APPROVED")
         self.assertEqual(resolved["resolved_by"], admin.id)
         self.assertIsNotNone(resolved["actual_checkout_time"])
+        self.assertEqual(resolved["admin_note"], "Admin entered actual checkout")
 
         daily_resolved = self.client.get(
             "/attendance/report/daily?from_date=2026-03-10&to_date=2026-03-10",
@@ -1121,7 +1238,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
         )
         self.assertEqual(daily_resolved.status_code, 200, daily_resolved.text)
         resolved_row = next(r for r in daily_resolved.json() if r["employee_code"] == "EM015")
-        self.assertEqual(resolved_row["exception_status"], "RESOLVED")
+        self.assertEqual(resolved_row["exception_status"], "APPROVED")
         self.assertEqual(resolved_row["attendance_state"], "COMPLETE")
         self.assertEqual(resolved_row["checkout_status"], "LATE")
         self.assertEqual(resolved_row["regular_minutes"], 540)
@@ -1131,27 +1248,11 @@ class MinimumFlowsTestCase(unittest.TestCase):
         reopen_res = self.client.patch(
             f"/reports/attendance-exceptions/{exception_id}/reopen",
             headers=admin_headers,
-            json={"note": "Need verify again"},
         )
-        self.assertEqual(reopen_res.status_code, 200, reopen_res.text)
-        reopened = reopen_res.json()
-        self.assertEqual(reopened["status"], "OPEN")
-        self.assertIsNone(reopened["resolved_by"])
-        self.assertIsNone(reopened["actual_checkout_time"])
-
-        daily_reopened = self.client.get(
-            "/attendance/report/daily?from_date=2026-03-10&to_date=2026-03-10",
-            headers=admin_headers,
-        )
-        self.assertEqual(daily_reopened.status_code, 200, daily_reopened.text)
-        reopened_row = next(r for r in daily_reopened.json() if r["employee_code"] == "EM015")
-        self.assertEqual(reopened_row["exception_status"], "OPEN")
-        self.assertEqual(reopened_row["attendance_state"], "PENDING_TIMESHEET")
-        self.assertEqual(reopened_row["checkout_status"], "NO_CHECKOUT")
-        self.assertEqual(reopened_row["payable_overtime_minutes"], 0)
+        self.assertEqual(reopen_res.status_code, 409, reopen_res.text)
 
         _FixedDateTime.fixed_now = None
-    def test_resolve_and_reopen_exception_recalculates_minutes(self) -> None:
+    def test_auto_closed_exception_approve_and_block_reopen(self) -> None:
         admin = self._create_user(email="admin_resolve@example.com", password="admin123", role="ADMIN")
         user = self._create_user(email="resolve_user@example.com", password="user123", role="USER")
 
@@ -1196,26 +1297,33 @@ class MinimumFlowsTestCase(unittest.TestCase):
         self.assertTrue(rows)
         exception_id = rows[0]["id"]
 
-        resolve_missing_time_res = self.client.patch(
-            f"/reports/attendance-exceptions/{exception_id}/resolve",
+        resolve_missing_time_res = self.client.post(
+            f"/reports/attendance-exceptions/{exception_id}/approve",
             headers=admin_headers,
-            json={"note": "AUTO_CLOSED requires actual checkout"},
+            json={},
         )
-        self.assertEqual(resolve_missing_time_res.status_code, 400, resolve_missing_time_res.text)
-        self.assertIn("actual_checkout_time is required for AUTO_CLOSED", resolve_missing_time_res.text)
+        self.assertEqual(resolve_missing_time_res.status_code, 409, resolve_missing_time_res.text)
 
 
-        resolve_res = self.client.patch(
-            f"/reports/attendance-exceptions/{exception_id}/resolve",
+        submit_explanation_res = self.client.post(
+            f"/reports/attendance-exceptions/{exception_id}/submit-explanation",
+            headers=headers,
+            json={"explanation": "Da checkout thuc te truoc khi he thong auto close"},
+        )
+        self.assertEqual(submit_explanation_res.status_code, 200, submit_explanation_res.text)
+        self.assertEqual(submit_explanation_res.json()["status"], "PENDING_ADMIN")
+
+        resolve_res = self.client.post(
+            f"/reports/attendance-exceptions/{exception_id}/approve",
             headers=admin_headers,
             json={
-                "note": "Admin confirmed checkout time",
+                "admin_note": "Admin confirmed checkout time",
                 "actual_checkout_time": "2026-03-10T10:00:00+00:00",
             },
         )
         self.assertEqual(resolve_res.status_code, 200, resolve_res.text)
         resolved = resolve_res.json()
-        self.assertEqual(resolved["status"], "RESOLVED")
+        self.assertEqual(resolved["status"], "APPROVED")
         self.assertEqual(resolved["resolved_by"], admin.id)
         self.assertIsNotNone(resolved["actual_checkout_time"])
 
@@ -1225,7 +1333,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
         )
         self.assertEqual(daily_resolved.status_code, 200, daily_resolved.text)
         resolved_row = next(r for r in daily_resolved.json() if r["employee_code"] == "EM013")
-        self.assertEqual(resolved_row["exception_status"], "RESOLVED")
+        self.assertEqual(resolved_row["exception_status"], "APPROVED")
         self.assertEqual(resolved_row["attendance_state"], "COMPLETE")
         self.assertEqual(resolved_row["checkout_status"], "ON_TIME")
         self.assertEqual(resolved_row["regular_minutes"], 540)
@@ -1235,27 +1343,487 @@ class MinimumFlowsTestCase(unittest.TestCase):
         reopen_res = self.client.patch(
             f"/reports/attendance-exceptions/{exception_id}/reopen",
             headers=admin_headers,
-            json={"note": "Need re-check attendance evidence"},
         )
-        self.assertEqual(reopen_res.status_code, 200, reopen_res.text)
-        reopened = reopen_res.json()
-        self.assertEqual(reopened["status"], "OPEN")
-        self.assertIsNone(reopened["resolved_by"])
-        self.assertIsNone(reopened["actual_checkout_time"])
-
-        daily_reopened = self.client.get(
-            "/attendance/report/daily?from_date=2026-03-10&to_date=2026-03-10",
-            headers=admin_headers,
-        )
-        self.assertEqual(daily_reopened.status_code, 200, daily_reopened.text)
-        reopened_row = next(r for r in daily_reopened.json() if r["employee_code"] == "EM013")
-        self.assertEqual(reopened_row["exception_status"], "OPEN")
-        self.assertEqual(reopened_row["attendance_state"], "PENDING_TIMESHEET")
-        self.assertEqual(reopened_row["checkout_status"], "SYSTEM_AUTO")
-        self.assertGreater(reopened_row["overtime_minutes"], 0)
-        self.assertEqual(reopened_row["payable_overtime_minutes"], 0)
+        self.assertEqual(reopen_res.status_code, 409, reopen_res.text)
 
         _FixedDateTime.fixed_now = None
+
+    def test_exception_workflow_reject_requires_note_and_writes_audit_trail(self) -> None:
+        admin = self._create_user(email="admin_exception_flow@example.com", password="admin123", role="ADMIN")
+        user = self._create_user(email="exception_flow_user@example.com", password="user123", role="USER")
+        employee = self._create_employee(code="EM099", full_name="Exception Flow User", user_id=user.id)
+        self._create_rule(latitude=10.7769, longitude=106.7009, radius_m=300)
+
+        token = self._login("exception_flow_user@example.com", "user123")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        _FixedDateTime.fixed_now = datetime(2026, 3, 10, 1, 0, tzinfo=timezone.utc)
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            in_res = self.client.post(
+                "/attendance/checkin",
+                headers=headers,
+                json={"lat": 10.7769, "lng": 106.7009},
+            )
+        self.assertEqual(in_res.status_code, 200, in_res.text)
+
+        with SessionLocal() as db:
+            source_checkin = (
+                db.query(AttendanceLog)
+                .filter(AttendanceLog.employee_id == employee.id, AttendanceLog.type == "IN")
+                .order_by(AttendanceLog.id.desc())
+                .first()
+            )
+            self.assertIsNotNone(source_checkin)
+            source_checkin_id = source_checkin.id
+
+        create_res = self.client.post(
+            "/reports/attendance-exceptions/system",
+            headers=self._system_headers(),
+            json={
+                "employee_id": employee.id,
+                "source_checkin_log_id": source_checkin_id,
+                "exception_type": "SUSPECTED_LOCATION_SPOOF",
+                "note": "GPS risk detected by system",
+            },
+        )
+        self.assertEqual(create_res.status_code, 200, create_res.text)
+        created = create_res.json()
+        exception_id = created["id"]
+        self.assertEqual(created["status"], "PENDING_EMPLOYEE")
+
+        invalid_approve_res = self.client.post(
+            f"/reports/attendance-exceptions/{exception_id}/approve",
+            headers={"Authorization": f"Bearer {self._login('admin_exception_flow@example.com', 'admin123')}"},
+            json={"admin_note": "Cannot bypass employee"},
+        )
+        self.assertEqual(invalid_approve_res.status_code, 409, invalid_approve_res.text)
+
+        submit_res = self.client.post(
+            f"/reports/attendance-exceptions/{exception_id}/submit-explanation",
+            headers=headers,
+            json={"explanation": "Toi khong gia mao GPS, vui long kiem tra lai"},
+        )
+        self.assertEqual(submit_res.status_code, 200, submit_res.text)
+        submitted = submit_res.json()
+        self.assertEqual(submitted["status"], "PENDING_ADMIN")
+        self.assertEqual(submitted["employee_explanation"], "Toi khong gia mao GPS, vui long kiem tra lai")
+
+        admin_headers = {"Authorization": f"Bearer {self._login('admin_exception_flow@example.com', 'admin123')}"}
+        reject_missing_note_res = self.client.post(
+            f"/reports/attendance-exceptions/{exception_id}/reject",
+            headers=admin_headers,
+            json={"admin_note": ""},
+        )
+        self.assertEqual(reject_missing_note_res.status_code, 422, reject_missing_note_res.text)
+
+        reject_res = self.client.post(
+            f"/reports/attendance-exceptions/{exception_id}/reject",
+            headers=admin_headers,
+            json={"admin_note": "Khong du bang chung de chap nhan giai trinh"},
+        )
+        self.assertEqual(reject_res.status_code, 200, reject_res.text)
+        rejected = reject_res.json()
+        self.assertEqual(rejected["status"], "REJECTED")
+        self.assertEqual(rejected["admin_note"], "Khong du bang chung de chap nhan giai trinh")
+        self.assertEqual(rejected["decided_by"], admin.id)
+        self.assertTrue(rejected["timeline"])
+
+        with SessionLocal() as db:
+            audits = (
+                db.query(AttendanceExceptionAudit)
+                .filter(AttendanceExceptionAudit.exception_id == exception_id)
+                .order_by(AttendanceExceptionAudit.id.asc())
+                .all()
+            )
+
+        self.assertEqual(
+            [audit.event_type for audit in audits],
+            [
+                "exception_detected",
+                "employee_explanation_submitted",
+                "admin_rejected",
+            ],
+        )
+        self.assertEqual(audits[0].next_status, "PENDING_EMPLOYEE")
+        self.assertEqual(audits[1].previous_status, "PENDING_EMPLOYEE")
+        self.assertEqual(audits[1].next_status, "PENDING_ADMIN")
+        self.assertEqual(audits[2].previous_status, "PENDING_ADMIN")
+        self.assertEqual(audits[2].next_status, "REJECTED")
+
+        _FixedDateTime.fixed_now = None
+
+    def test_exception_transition_blocks_invalid_pending_and_terminal_paths(self) -> None:
+        admin = self._create_user(email="admin_transition_guard@example.com", password="admin123", role="ADMIN")
+        user = self._create_user(email="transition_guard_user@example.com", password="user123", role="USER")
+        employee = self._create_employee(code="EMTG1", full_name="Transition Guard User", user_id=user.id)
+        admin_headers = {"Authorization": f"Bearer {create_access_token({'sub': str(admin.id), 'role': admin.role})}"}
+        user_headers = {"Authorization": f"Bearer {create_access_token({'sub': str(user.id), 'role': user.role})}"}
+
+        def create_checkin_log(work_date_value: date, happened_at: datetime) -> int:
+            with SessionLocal() as db:
+                log = AttendanceLog(
+                    employee_id=employee.id,
+                    type="IN",
+                    time=happened_at,
+                    work_date=work_date_value,
+                    lat=10.7769,
+                    lng=106.7009,
+                    is_out_of_range=False,
+                    punctuality_status="ON_TIME",
+                )
+                db.add(log)
+                db.commit()
+                db.refresh(log)
+                return log.id
+
+        def create_system_exception(source_log_id: int, exception_type: str, note: str) -> dict:
+            res = self.client.post(
+                "/reports/attendance-exceptions/system",
+                headers=self._system_headers(),
+                json={
+                    "employee_id": employee.id,
+                    "source_checkin_log_id": source_log_id,
+                    "exception_type": exception_type,
+                    "note": note,
+                    "detected_at": "2026-03-20T00:00:00+00:00",
+                    "expires_at": "2026-03-23T00:00:00+00:00",
+                },
+            )
+            self.assertEqual(res.status_code, 200, res.text)
+            return res.json()
+
+        pending_employee = create_system_exception(
+            create_checkin_log(date(2026, 3, 20), datetime(2026, 3, 20, 1, 0, tzinfo=timezone.utc)),
+            "SUSPECTED_LOCATION_SPOOF",
+            "GPS risk requires employee explanation",
+        )
+        self.assertEqual(pending_employee["status"], "PENDING_EMPLOYEE")
+        pending_employee_id = pending_employee["id"]
+
+        invalid_reject_res = self.client.post(
+            f"/reports/attendance-exceptions/{pending_employee_id}/reject",
+            headers=admin_headers,
+            json={"admin_note": "Cannot reject before employee explanation"},
+        )
+        self.assertEqual(invalid_reject_res.status_code, 409, invalid_reject_res.text)
+
+        submit_res = self.client.post(
+            f"/reports/attendance-exceptions/{pending_employee_id}/submit-explanation",
+            headers=user_headers,
+            json={"explanation": "Employee explanation for GPS risk"},
+        )
+        self.assertEqual(submit_res.status_code, 200, submit_res.text)
+        self.assertEqual(submit_res.json()["status"], "PENDING_ADMIN")
+
+        approve_res = self.client.post(
+            f"/reports/attendance-exceptions/{pending_employee_id}/approve",
+            headers=admin_headers,
+            json={"admin_note": "Accepted explanation"},
+        )
+        self.assertEqual(approve_res.status_code, 200, approve_res.text)
+        self.assertEqual(approve_res.json()["status"], "APPROVED")
+
+        submit_after_approved_res = self.client.post(
+            f"/reports/attendance-exceptions/{pending_employee_id}/submit-explanation",
+            headers=user_headers,
+            json={"explanation": "Late edit after approval"},
+        )
+        self.assertEqual(submit_after_approved_res.status_code, 409, submit_after_approved_res.text)
+
+        pending_admin = create_system_exception(
+            create_checkin_log(date(2026, 3, 21), datetime(2026, 3, 21, 1, 0, tzinfo=timezone.utc)),
+            "LARGE_TIME_DEVIATION",
+            "Large time deviation can go directly to admin",
+        )
+        self.assertEqual(pending_admin["status"], "PENDING_ADMIN")
+        pending_admin_id = pending_admin["id"]
+
+        reject_res = self.client.post(
+            f"/reports/attendance-exceptions/{pending_admin_id}/reject",
+            headers=admin_headers,
+            json={"admin_note": "Rejected direct-admin exception"},
+        )
+        self.assertEqual(reject_res.status_code, 200, reject_res.text)
+        self.assertEqual(reject_res.json()["status"], "REJECTED")
+
+        submit_after_rejected_res = self.client.post(
+            f"/reports/attendance-exceptions/{pending_admin_id}/submit-explanation",
+            headers=user_headers,
+            json={"explanation": "Late edit after rejection"},
+        )
+        self.assertEqual(submit_after_rejected_res.status_code, 409, submit_after_rejected_res.text)
+
+        expiring = create_system_exception(
+            create_checkin_log(date(2026, 3, 22), datetime(2026, 3, 22, 1, 0, tzinfo=timezone.utc)),
+            "SUSPECTED_LOCATION_SPOOF",
+            "GPS risk will expire",
+        )
+        expire_res = self.client.post(
+            f"/reports/attendance-exceptions/{expiring['id']}/expire",
+            headers=self._system_headers(),
+        )
+        self.assertEqual(expire_res.status_code, 200, expire_res.text)
+        self.assertEqual(expire_res.json()["status"], "EXPIRED")
+
+        submit_after_expired_res = self.client.post(
+            f"/reports/attendance-exceptions/{expiring['id']}/submit-explanation",
+            headers=user_headers,
+            json={"explanation": "Late edit after expiration"},
+        )
+        self.assertEqual(submit_after_expired_res.status_code, 409, submit_after_expired_res.text)
+
+    def test_exception_workflow_notifications_for_action_endpoints(self) -> None:
+        admin = self._create_user(email="admin_notify@example.com", password="admin123", role="ADMIN")
+        user = self._create_user(email="notify_user@example.com", password="user123", role="USER")
+        employee = self._create_employee(code="EMN01", full_name="Notify User", user_id=user.id)
+        admin_headers = {"Authorization": f"Bearer {create_access_token({'sub': str(admin.id), 'role': admin.role})}"}
+        user_headers = {"Authorization": f"Bearer {create_access_token({'sub': str(user.id), 'role': user.role})}"}
+
+        first_log = self._create_attendance_log(
+            employee_id=employee.id,
+            work_date_value=date(2026, 3, 12),
+            happened_at=datetime(2026, 3, 12, 1, 0, tzinfo=timezone.utc),
+        )
+        second_log = self._create_attendance_log(
+            employee_id=employee.id,
+            work_date_value=date(2026, 3, 13),
+            happened_at=datetime(2026, 3, 13, 1, 0, tzinfo=timezone.utc),
+        )
+        third_log = self._create_attendance_log(
+            employee_id=employee.id,
+            work_date_value=date(2026, 3, 14),
+            happened_at=datetime(2026, 3, 14, 1, 0, tzinfo=timezone.utc),
+        )
+
+        spy_mail = _SpyMailSender()
+        with patch("app.services.attendance_exception_notifications.get_mail_sender", return_value=spy_mail):
+            create_res = self.client.post(
+                "/reports/attendance-exceptions/system",
+                headers=self._system_headers(),
+                json={
+                    "employee_id": employee.id,
+                    "source_checkin_log_id": first_log.id,
+                    "exception_type": "SUSPECTED_LOCATION_SPOOF",
+                    "note": "GPS risk detected",
+                },
+            )
+            self.assertEqual(create_res.status_code, 200, create_res.text)
+            exception_id = create_res.json()["id"]
+            self.assertEqual(spy_mail.sent[-1].event_type, "exception_detected_employee")
+            self.assertEqual(spy_mail.sent[-1].to_email, user.email)
+
+            sent_count_before_invalid = len(spy_mail.sent)
+            invalid_approve_res = self.client.post(
+                f"/reports/attendance-exceptions/{exception_id}/approve",
+                headers=admin_headers,
+                json={"admin_note": "Cannot bypass employee"},
+            )
+            self.assertEqual(invalid_approve_res.status_code, 409, invalid_approve_res.text)
+            self.assertEqual(len(spy_mail.sent), sent_count_before_invalid)
+
+            submit_res = self.client.post(
+                f"/reports/attendance-exceptions/{exception_id}/submit-explanation",
+                headers=user_headers,
+                json={"explanation": "Can admin kiem tra lai"},
+            )
+            self.assertEqual(submit_res.status_code, 200, submit_res.text)
+            self.assertEqual(spy_mail.sent[-1].event_type, "exception_submitted_admin")
+            self.assertEqual(spy_mail.sent[-1].to_email, admin.email)
+
+            approve_res = self.client.post(
+                f"/reports/attendance-exceptions/{exception_id}/approve",
+                headers=admin_headers,
+                json={"admin_note": "Chap nhan giai trinh"},
+            )
+            self.assertEqual(approve_res.status_code, 200, approve_res.text)
+            self.assertEqual(spy_mail.sent[-1].event_type, "exception_approved_employee")
+            self.assertEqual(spy_mail.sent[-1].to_email, user.email)
+
+            direct_admin_res = self.client.post(
+                "/reports/attendance-exceptions/system",
+                headers=self._system_headers(),
+                json={
+                    "employee_id": employee.id,
+                    "source_checkin_log_id": second_log.id,
+                    "exception_type": "LARGE_TIME_DEVIATION",
+                    "note": "Large time deviation",
+                },
+            )
+            self.assertEqual(direct_admin_res.status_code, 200, direct_admin_res.text)
+            self.assertEqual(direct_admin_res.json()["status"], "PENDING_ADMIN")
+            self.assertEqual(spy_mail.sent[-1].event_type, "exception_detected_admin")
+            self.assertEqual(spy_mail.sent[-1].to_email, admin.email)
+
+            reject_create_res = self.client.post(
+                "/reports/attendance-exceptions/system",
+                headers=self._system_headers(),
+                json={
+                    "employee_id": employee.id,
+                    "source_checkin_log_id": third_log.id,
+                    "exception_type": "SUSPECTED_LOCATION_SPOOF",
+                    "note": "GPS risk detected again",
+                },
+            )
+            self.assertEqual(reject_create_res.status_code, 200, reject_create_res.text)
+            reject_exception_id = reject_create_res.json()["id"]
+            reject_submit_res = self.client.post(
+                f"/reports/attendance-exceptions/{reject_exception_id}/submit-explanation",
+                headers=user_headers,
+                json={"explanation": "Giai trinh khong du bang chung"},
+            )
+            self.assertEqual(reject_submit_res.status_code, 200, reject_submit_res.text)
+            reject_res = self.client.post(
+                f"/reports/attendance-exceptions/{reject_exception_id}/reject",
+                headers=admin_headers,
+                json={"admin_note": "Khong du bang chung"},
+            )
+            self.assertEqual(reject_res.status_code, 200, reject_res.text)
+            self.assertEqual(spy_mail.sent[-1].event_type, "exception_rejected_employee")
+            self.assertEqual(spy_mail.sent[-1].to_email, user.email)
+
+        with SessionLocal() as db:
+            notifications = (
+                db.query(AttendanceExceptionNotification)
+                .order_by(AttendanceExceptionNotification.id.asc())
+                .all()
+            )
+        self.assertIn("exception_detected_employee", [item.event_type for item in notifications])
+        self.assertIn("exception_submitted_admin", [item.event_type for item in notifications])
+        self.assertIn("exception_approved_employee", [item.event_type for item in notifications])
+        self.assertIn("exception_detected_admin", [item.event_type for item in notifications])
+        self.assertIn("exception_rejected_employee", [item.event_type for item in notifications])
+        self.assertTrue(all(item.status == "SENT" for item in notifications))
+
+    def test_exception_jobs_expire_and_reminder_are_idempotent(self) -> None:
+        user = self._create_user(email="job_notify_user@example.com", password="user123", role="USER")
+        employee = self._create_employee(code="EMJ01", full_name="Job Notify User", user_id=user.id)
+        now = datetime(2026, 3, 15, 1, 0, tzinfo=timezone.utc)
+        reminder_log = self._create_attendance_log(
+            employee_id=employee.id,
+            work_date_value=date(2026, 3, 15),
+            happened_at=now,
+        )
+        expired_log = self._create_attendance_log(
+            employee_id=employee.id,
+            work_date_value=date(2026, 3, 16),
+            happened_at=now + timedelta(days=1),
+        )
+        approved_log = self._create_attendance_log(
+            employee_id=employee.id,
+            work_date_value=date(2026, 3, 17),
+            happened_at=now + timedelta(days=2),
+        )
+        rejected_log = self._create_attendance_log(
+            employee_id=employee.id,
+            work_date_value=date(2026, 3, 18),
+            happened_at=now + timedelta(days=3),
+        )
+
+        with SessionLocal() as db:
+            reminder_exception = AttendanceException(
+                employee_id=employee.id,
+                source_checkin_log_id=reminder_log.id,
+                exception_type="SUSPECTED_LOCATION_SPOOF",
+                work_date=date(2026, 3, 15),
+                status="PENDING_EMPLOYEE",
+                detected_at=now - timedelta(days=2),
+                expires_at=now + timedelta(hours=12),
+            )
+            expired_exception = AttendanceException(
+                employee_id=employee.id,
+                source_checkin_log_id=expired_log.id,
+                exception_type="SUSPECTED_LOCATION_SPOOF",
+                work_date=date(2026, 3, 16),
+                status="PENDING_EMPLOYEE",
+                detected_at=now - timedelta(days=4),
+                expires_at=now - timedelta(minutes=1),
+            )
+            approved_exception = AttendanceException(
+                employee_id=employee.id,
+                source_checkin_log_id=approved_log.id,
+                exception_type="SUSPECTED_LOCATION_SPOOF",
+                work_date=date(2026, 3, 17),
+                status="APPROVED",
+                detected_at=now - timedelta(days=5),
+                expires_at=now - timedelta(days=1),
+            )
+            rejected_exception = AttendanceException(
+                employee_id=employee.id,
+                source_checkin_log_id=rejected_log.id,
+                exception_type="SUSPECTED_LOCATION_SPOOF",
+                work_date=date(2026, 3, 18),
+                status="REJECTED",
+                detected_at=now - timedelta(days=5),
+                expires_at=now - timedelta(days=1),
+            )
+            db.add_all([
+                reminder_exception,
+                expired_exception,
+                approved_exception,
+                rejected_exception,
+            ])
+            db.commit()
+            db.refresh(reminder_exception)
+            db.refresh(expired_exception)
+            db.refresh(approved_exception)
+            db.refresh(rejected_exception)
+            reminder_exception_id = reminder_exception.id
+            expired_exception_id = expired_exception.id
+            approved_exception_id = approved_exception.id
+            rejected_exception_id = rejected_exception.id
+
+        spy_mail = _SpyMailSender()
+        with patch("app.services.attendance_exception_notifications.get_mail_sender", return_value=spy_mail):
+            with SessionLocal() as db:
+                self.assertEqual(send_expire_reminders(db, now=now), 1)
+            with SessionLocal() as db:
+                self.assertEqual(send_expire_reminders(db, now=now), 0)
+            with SessionLocal() as db:
+                self.assertEqual(expire_overdue_exceptions(db, now=now), 1)
+            with SessionLocal() as db:
+                self.assertEqual(expire_overdue_exceptions(db, now=now), 0)
+
+        self.assertEqual(
+            [payload.event_type for payload in spy_mail.sent],
+            [
+                "exception_expire_reminder_employee",
+                "exception_expired_employee",
+            ],
+        )
+
+        with SessionLocal() as db:
+            refreshed_reminder = db.query(AttendanceException).filter(AttendanceException.id == reminder_exception_id).first()
+            refreshed_expired = db.query(AttendanceException).filter(AttendanceException.id == expired_exception_id).first()
+            refreshed_approved = db.query(AttendanceException).filter(AttendanceException.id == approved_exception_id).first()
+            refreshed_rejected = db.query(AttendanceException).filter(AttendanceException.id == rejected_exception_id).first()
+            notifications = (
+                db.query(AttendanceExceptionNotification)
+                .order_by(AttendanceExceptionNotification.event_type.asc())
+                .all()
+            )
+            expire_audit = (
+                db.query(AttendanceExceptionAudit)
+                .filter(
+                    AttendanceExceptionAudit.exception_id == expired_exception_id,
+                    AttendanceExceptionAudit.event_type == "system_expired",
+                )
+                .first()
+            )
+
+        self.assertEqual(refreshed_reminder.status, "PENDING_EMPLOYEE")
+        self.assertEqual(refreshed_expired.status, "EXPIRED")
+        self.assertEqual(refreshed_approved.status, "APPROVED")
+        self.assertEqual(refreshed_rejected.status, "REJECTED")
+        self.assertIsNotNone(expire_audit)
+        self.assertEqual(
+            sorted(item.event_type for item in notifications),
+            [
+                "exception_expire_reminder_employee",
+                "exception_expired_employee",
+            ],
+        )
+        self.assertTrue(all(item.status == "SENT" for item in notifications))
+
     def test_same_day_open_in_still_blocks_second_checkin(self) -> None:
         user = self._create_user(email="same_day_user@example.com", password="user123", role="USER")
         self._create_employee(code="EM012", full_name="Same Day User", user_id=user.id)
@@ -1616,16 +2184,6 @@ class MinimumFlowsTestCase(unittest.TestCase):
             self.assertEqual(len(out_logs), 1)
 if __name__ == "__main__":
     unittest.main()
-
-
-
-
-
-
-
-
-
-
 
 
 

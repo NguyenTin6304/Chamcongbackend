@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     # Optional comma-separated hostnames. Example: "localhost,chamcongweb.vercel.app"
     RECAPTCHA_ALLOWED_HOSTNAMES: str = ""
     RISK_POLICY_VERSION: str = "v1"
+    EXCEPTION_WORKFLOW_SYSTEM_KEY: str = ""
+    LARGE_TIME_DEVIATION_THRESHOLD_MINUTES: int = 120
 
 
 settings = Settings()

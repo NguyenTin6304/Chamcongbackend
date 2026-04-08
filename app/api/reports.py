@@ -2,7 +2,7 @@
 from io import BytesIO
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
@@ -11,14 +11,44 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Session, aliased
 
 from app.core.db import get_db
-from app.core.deps import require_admin
-from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, Group, User
-from app.schemas.attendance import AttendanceExceptionReopenRequest, AttendanceExceptionReportResponse, AttendanceExceptionResolveRequest
+from app.core.deps import get_current_user, require_admin, require_exception_workflow_system
+from app.models import AttendanceException, AttendanceExceptionAudit, AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, User
+from app.schemas.attendance import (
+    AttendanceExceptionApproveRequest,
+    AttendanceExceptionAuditResponse,
+    AttendanceExceptionCreateRequest,
+    AttendanceExceptionDetailResponse,
+    AttendanceExceptionRejectRequest,
+    AttendanceExceptionReportResponse,
+    AttendanceExceptionResolveRequest,
+    AttendanceExceptionSubmitExplanationRequest,
+)
+from app.services.attendance_exception_workflow import (
+    APPROVED,
+    EXPIRED,
+    PENDING_ADMIN,
+    PENDING_EMPLOYEE,
+    REJECTED,
+    default_exception_status_for_type,
+    build_exception_status_filter_values,
+    ensure_allowed_exception_transition,
+    is_pending_exception_status,
+    is_pending_timesheet_exception,
+    normalize_exception_status,
+)
+from app.services.attendance_exception_audit import record_attendance_exception_audit
+from app.services.attendance_exception_notifications import (
+    build_exception_notification_mail,
+    create_exception_notification_record,
+    send_exception_notification_background,
+)
 from app.services.attendance_time import (
     DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
+    VN_TZ as _ATT_VN_TZ,
     classify_checkout_status,
     normalize_utc,
     split_regular_overtime_minutes,
+    to_vn_time,
     work_date_cutoff_utc,
 )
 from app.services.report_consistency import (
@@ -42,6 +72,16 @@ def _deserialize_risk_flags(raw: str | None) -> list[str]:
     if isinstance(parsed, list):
         return [str(x) for x in parsed if str(x).strip()]
     return []
+
+
+def _deserialize_metadata_json(raw: str | None) -> dict[str, object]:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _normalize_exception_type(value: str) -> str:
@@ -235,8 +275,9 @@ def _build_exception_map(
     for row in q.all():
         key = (row.employee_id, row.work_date)
         current = status_map.get(key)
-        if current is None or current[0] != "OPEN":
-            status_map[key] = (row.status, row.exception_type)
+        normalized_status = normalize_exception_status(row.status)
+        if current is None or not is_pending_exception_status(current[0]):
+            status_map[key] = (normalized_status, row.exception_type)
     return status_map
 
 
@@ -245,7 +286,7 @@ def _apply_exception_to_attendance_state(
     exception_status: str | None,
     exception_type: str | None,
 ) -> str:
-    if exception_status == "OPEN" and exception_type in {"AUTO_CLOSED", "MISSED_CHECKOUT"}:
+    if is_pending_timesheet_exception(exception_status, exception_type):
         return "PENDING_TIMESHEET"
     return attendance_state
 
@@ -258,7 +299,7 @@ def _compute_payable_overtime_minutes(
 ) -> int | None:
     if overtime_minutes is None:
         return None
-    if exception_status == "OPEN" and exception_type in {"AUTO_CLOSED", "MISSED_CHECKOUT"}:
+    if is_pending_timesheet_exception(exception_status, exception_type):
         return 0
     return overtime_minutes
 
@@ -350,8 +391,47 @@ def _revert_checkout_log_for_reopen(
         db.delete(checkout_log)
 
 
-def _build_exception_response(db: Session, exception_id: int) -> AttendanceExceptionReportResponse:
+def _can_submit_explanation(status: str | None) -> bool:
+    return normalize_exception_status(status) == PENDING_EMPLOYEE
+
+
+def _can_admin_decide(status: str | None) -> bool:
+    return normalize_exception_status(status) == PENDING_ADMIN
+
+
+def _can_expire(status: str | None, expires_at: datetime | None) -> bool:
+    normalized = normalize_exception_status(status)
+    if normalized != PENDING_EMPLOYEE or expires_at is None:
+        return False
+    return normalize_utc(expires_at) <= datetime.now(timezone.utc)
+
+
+def _build_exception_timeline(db: Session, exception_id: int) -> list[AttendanceExceptionAuditResponse]:
+    rows = (
+        db.query(AttendanceExceptionAudit)
+        .filter(AttendanceExceptionAudit.exception_id == exception_id)
+        .order_by(AttendanceExceptionAudit.created_at.asc(), AttendanceExceptionAudit.id.asc())
+        .all()
+    )
+    return [
+        AttendanceExceptionAuditResponse(
+            id=row.id,
+            event_type=row.event_type,
+            previous_status=normalize_exception_status(row.previous_status),
+            next_status=normalize_exception_status(row.next_status),
+            actor_type=row.actor_type,
+            actor_id=row.actor_id,
+            actor_email=row.actor_email,
+            metadata=_deserialize_metadata_json(row.metadata_json),
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+
+
+def _build_exception_response(db: Session, exception_id: int) -> AttendanceExceptionDetailResponse:
     resolver = aliased(User)
+    decider = aliased(User)
     row = (
         db.query(
             AttendanceException.id.label("id"),
@@ -374,6 +454,14 @@ def _build_exception_response(db: Session, exception_id: int) -> AttendanceExcep
             AttendanceLog.risk_policy_version.label("risk_policy_version"),
             AttendanceException.actual_checkout_time.label("actual_checkout_time"),
             AttendanceException.created_at.label("created_at"),
+            AttendanceException.detected_at.label("detected_at"),
+            AttendanceException.expires_at.label("expires_at"),
+            AttendanceException.employee_explanation.label("employee_explanation"),
+            AttendanceException.employee_submitted_at.label("employee_submitted_at"),
+            AttendanceException.admin_note.label("admin_note"),
+            AttendanceException.admin_decided_at.label("admin_decided_at"),
+            AttendanceException.decided_by.label("decided_by"),
+            decider.email.label("decided_by_email"),
             AttendanceException.resolved_at.label("resolved_at"),
             AttendanceException.resolved_by.label("resolved_by"),
             resolver.email.label("resolved_by_email"),
@@ -381,6 +469,7 @@ def _build_exception_response(db: Session, exception_id: int) -> AttendanceExcep
         .join(Employee, Employee.id == AttendanceException.employee_id)
         .outerjoin(Group, Group.id == Employee.group_id)
         .outerjoin(AttendanceLog, AttendanceLog.id == AttendanceException.source_checkin_log_id)
+        .outerjoin(decider, decider.id == AttendanceException.decided_by)
         .outerjoin(resolver, resolver.id == AttendanceException.resolved_by)
         .filter(AttendanceException.id == exception_id)
         .first()
@@ -389,7 +478,7 @@ def _build_exception_response(db: Session, exception_id: int) -> AttendanceExcep
     if row is None:
         raise HTTPException(status_code=404, detail="attendance_exception not found")
 
-    return AttendanceExceptionReportResponse(
+    return AttendanceExceptionDetailResponse(
         id=row.id,
         employee_id=row.employee_id,
         employee_code=row.employee_code,
@@ -398,7 +487,7 @@ def _build_exception_response(db: Session, exception_id: int) -> AttendanceExcep
         group_name=row.group_name,
         work_date=row.work_date,
         exception_type=_normalize_exception_type(row.exception_type),
-        status=row.status,
+        status=normalize_exception_status(row.status),
         note=row.note,
         resolved_note=row.resolved_note,
         risk_score=row.risk_score,
@@ -407,12 +496,127 @@ def _build_exception_response(db: Session, exception_id: int) -> AttendanceExcep
         risk_policy_version=row.risk_policy_version,
         source_checkin_log_id=row.source_checkin_log_id,
         source_checkin_time=row.source_checkin_time,
+        detected_at=row.detected_at,
+        expires_at=row.expires_at,
+        employee_explanation=row.employee_explanation,
+        employee_submitted_at=row.employee_submitted_at,
+        admin_note=row.admin_note,
+        admin_decided_at=row.admin_decided_at,
+        decided_by=row.decided_by,
+        decided_by_email=row.decided_by_email,
         actual_checkout_time=row.actual_checkout_time,
         created_at=row.created_at,
         resolved_at=row.resolved_at,
         resolved_by=row.resolved_by,
         resolved_by_email=row.resolved_by_email,
+        can_submit_explanation=_can_submit_explanation(row.status),
+        can_admin_decide=_can_admin_decide(row.status),
+        can_expire=_can_expire(row.status, row.expires_at),
+        timeline=_build_exception_timeline(db, row.id),
     )
+
+
+def _get_exception_or_404(db: Session, exception_id: int) -> AttendanceException:
+    exception = db.query(AttendanceException).filter(AttendanceException.id == exception_id).first()
+    if exception is None:
+        raise HTTPException(status_code=404, detail="attendance_exception not found")
+    return exception
+
+
+def _get_employee_for_user(db: Session, user: User) -> Employee:
+    employee = db.query(Employee).filter(Employee.user_id == user.id).first()
+    if employee is None:
+        raise HTTPException(status_code=400, detail="User is not linked to an employee")
+    return employee
+
+
+def _queue_employee_exception_notification(
+    background_tasks: BackgroundTasks,
+    db: Session,
+    *,
+    event_type: str,
+    exception: AttendanceException,
+    employee: Employee,
+    admin_user: User | None = None,
+    extra_metadata: dict[str, object] | None = None,
+) -> None:
+    if employee.user_id is None:
+        return
+    employee_user = db.query(User).filter(User.id == employee.user_id).first()
+    if employee_user is None or not employee_user.email:
+        return
+    payload = build_exception_notification_mail(
+        event_type=event_type,
+        to_email=employee_user.email,
+        exception=exception,
+        employee=employee,
+        recipient_role="EMPLOYEE",
+        admin_user=admin_user,
+        extra_metadata=extra_metadata,
+    )
+    if payload is None:
+        return
+    notification = create_exception_notification_record(
+        db,
+        payload=payload,
+        exception_id=exception.id,
+        recipient_user_id=employee_user.id,
+        recipient_role="EMPLOYEE",
+        dedupe_key=f"exception:{exception.id}:{event_type}:employee:{employee_user.id}",
+    )
+    if notification is not None:
+        background_tasks.add_task(send_exception_notification_background, payload, notification.id)
+
+
+def _queue_admin_exception_notifications(
+    background_tasks: BackgroundTasks,
+    db: Session,
+    *,
+    event_type: str,
+    exception: AttendanceException,
+    employee: Employee,
+    extra_metadata: dict[str, object] | None = None,
+) -> None:
+    admins = db.query(User).filter(User.role == "ADMIN").all()
+    for admin in admins:
+        if not admin.email:
+            continue
+        admin_metadata = dict(extra_metadata or {})
+        admin_metadata["employee_email"] = None
+        payload = build_exception_notification_mail(
+            event_type=event_type,
+            to_email=admin.email,
+            exception=exception,
+            employee=employee,
+            recipient_role="ADMIN",
+            admin_user=admin,
+            extra_metadata=admin_metadata,
+        )
+        if payload is None:
+            continue
+        notification = create_exception_notification_record(
+            db,
+            payload=payload,
+            exception_id=exception.id,
+            recipient_user_id=admin.id,
+            recipient_role="ADMIN",
+            dedupe_key=f"exception:{exception.id}:{event_type}:admin:{admin.id}",
+        )
+        if notification is not None:
+            background_tasks.add_task(send_exception_notification_background, payload, notification.id)
+
+
+def _normalize_action_note(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _default_expires_at(detected_at: datetime, status: str) -> datetime | None:
+    if status != PENDING_EMPLOYEE:
+        return None
+    return detected_at + timedelta(days=3)
 
 def _to_excel_date(value: date | datetime | str | None) -> str | None:
     if value is None:
@@ -439,12 +643,422 @@ def _to_excel_datetime(value: datetime | str | None) -> str | None:
     return value.astimezone(VN_TZ).isoformat(sep=" ", timespec="seconds")
 
 
+# ---------------------------------------------------------------------------
+# Dashboard endpoints consumed by the Flutter admin panel
+# ---------------------------------------------------------------------------
+
+
+@router.get("/dashboard")
+def get_dashboard_summary(
+    date_param: date = Query(..., alias="date"),
+    group_id: int | None = None,
+    status: str | None = None,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """KPI summary cards for the admin dashboard."""
+
+    # -- total employees (optionally filtered by group) --
+    total_emp_q = db.query(func.count(Employee.id))
+    if group_id:
+        total_emp_q = total_emp_q.filter(Employee.group_id == group_id)
+    total_employees: int = total_emp_q.scalar() or 0
+
+    # -- checked-in employees on the given date --
+    checked_in_q = (
+        db.query(func.count(func.distinct(AttendanceLog.employee_id)))
+        .filter(AttendanceLog.work_date == date_param, AttendanceLog.type == "IN")
+    )
+    if group_id:
+        checked_in_q = checked_in_q.join(
+            Employee, Employee.id == AttendanceLog.employee_id
+        ).filter(Employee.group_id == group_id)
+    checked_in: int = checked_in_q.scalar() or 0
+
+    # -- late count --
+    late_q = (
+        db.query(func.count(AttendanceLog.id))
+        .filter(
+            AttendanceLog.work_date == date_param,
+            AttendanceLog.type == "IN",
+            AttendanceLog.punctuality_status == "LATE",
+        )
+    )
+    if group_id:
+        late_q = late_q.join(
+            Employee, Employee.id == AttendanceLog.employee_id
+        ).filter(Employee.group_id == group_id)
+    late_count: int = late_q.scalar() or 0
+
+    # -- out of range --
+    oor_q = (
+        db.query(func.count(AttendanceLog.id))
+        .filter(
+            AttendanceLog.work_date == date_param,
+            AttendanceLog.type == "IN",
+            AttendanceLog.is_out_of_range.is_(True),
+        )
+    )
+    if group_id:
+        oor_q = oor_q.join(
+            Employee, Employee.id == AttendanceLog.employee_id
+        ).filter(Employee.group_id == group_id)
+    out_of_range_count: int = oor_q.scalar() or 0
+
+    # -- geofence counts --
+    active_geofence_q = db.query(func.count(GroupGeofence.id)).filter(GroupGeofence.active.is_(True))
+    inactive_geofence_q = db.query(func.count(GroupGeofence.id)).filter(GroupGeofence.active.is_(False))
+    geofence_count: int = active_geofence_q.scalar() or 0
+    inactive_geofence_count: int = inactive_geofence_q.scalar() or 0
+
+    attendance_rate = (checked_in / total_employees * 100) if total_employees > 0 else 0
+    late_rate = (late_count / checked_in * 100) if checked_in > 0 else 0
+
+    return {
+        "total_employees": total_employees,
+        "checked_in": checked_in,
+        "attendance_rate": round(attendance_rate, 1),
+        "late_count": late_count,
+        "late_rate": round(late_rate, 1),
+        "out_of_range_count": out_of_range_count,
+        "geofence_count": geofence_count,
+        "inactive_geofence_count": inactive_geofence_count,
+        "employee_growth_percent": 0,
+    }
+
+
+@router.get("/attendance-logs")
+def list_attendance_logs_for_dashboard(
+    date_param: date | None = Query(None, alias="date"),
+    from_date: date | None = Query(None, alias="from"),
+    to_date: date | None = Query(None, alias="to"),
+    group_id: int | None = None,
+    status: str | None = None,
+    search: str | None = None,
+    sort: str | None = None,
+    page: int | None = None,
+    limit: int | None = None,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """Return attendance-log rows for the dashboard table."""
+
+    effective_from = date_param or from_date
+    effective_to = date_param or to_date
+
+    rows = _fetch_daily_report_rows(db, effective_from, effective_to, None, group_id)
+    exception_map = _build_exception_map(db, effective_from, effective_to, None, group_id)
+
+    result: list[dict] = []
+    for row in rows:
+        checkin_status, checkout_status_val, attendance_state = _derive_daily_status(
+            row.checkin_time, row.checkout_time,
+            row.punctuality_rank, row.checkout_rank,
+            row.checkout_raw_status,
+        )
+        exc_status, exc_type = exception_map.get((row.employee_id, row.work_date), (None, None))
+        attendance_state = _apply_exception_to_attendance_state(attendance_state, exc_status, exc_type)
+
+        # Apply status filter
+        if status and status != "all":
+            normalised_filter = status.upper()
+            if normalised_filter == "ON_TIME" and checkin_status != "ON_TIME":
+                continue
+            elif normalised_filter == "LATE" and checkin_status != "LATE":
+                continue
+            elif normalised_filter == "EARLY" and checkin_status != "EARLY":
+                continue
+            elif normalised_filter == "ABSENT" and attendance_state != "ABSENT":
+                continue
+            elif normalised_filter == "OUT_OF_RANGE" and not row.out_of_range:
+                continue
+
+        # Apply search filter
+        if search and search.strip():
+            needle = search.strip().lower()
+            haystack = f"{row.employee_code} {row.full_name} {row.group_name or ''}".lower()
+            if needle not in haystack:
+                continue
+
+        checkin_vn = to_vn_time(row.checkin_time).strftime("%H:%M") if row.checkin_time else "--:--"
+        checkout_vn = to_vn_time(row.checkout_time).strftime("%H:%M") if row.checkout_time else "--:--"
+
+        total_hours = "--"
+        if row.checkin_time and row.checkout_time:
+            delta = row.checkout_time - row.checkin_time
+            hours = delta.total_seconds() / 3600
+            total_hours = f"{hours:.1f}h"
+
+        out_of_range_val = bool(row.out_of_range) if row.out_of_range is not None else False
+        location_status = "outside" if out_of_range_val else "inside"
+
+        # "status" is used by the dashboard badge (punctuality-based).
+        # "attendance_status" keeps the full daily state.
+        display_status = checkin_status or attendance_state or "on_time"
+
+        result.append({
+            "id": row.employee_id,
+            "employee_name": row.full_name,
+            "employee_code": row.employee_code,
+            "department_name": row.group_name or "-",
+            "group_name": row.group_name or "-",
+            "work_date": row.work_date.isoformat() if row.work_date else None,
+            "check_in_time": checkin_vn,
+            "check_out_time": checkout_vn,
+            "total_hours": total_hours,
+            "location_status": location_status,
+            "status": display_status,
+            "attendance_status": attendance_state,
+            "checkin_status": checkin_status,
+            "checkout_status": checkout_status_val,
+            "latitude": None,
+            "longitude": None,
+        })
+
+    # Sort
+    if sort:
+        reverse = sort.startswith("-")
+        sort_key = sort.lstrip("-")
+        if sort_key in ("employee_name", "check_in_time", "attendance_status"):
+            result.sort(key=lambda r: r.get(sort_key, ""), reverse=reverse)
+
+    # Pagination
+    total = len(result)
+    if page and limit:
+        start = (page - 1) * limit
+        result = result[start : start + limit]
+
+    return {"data": result, "total": total}
+
+
+@router.get("/weekly-trends")
+def get_weekly_trends(
+    date_param: date = Query(..., alias="date"),
+    group_id: int | None = None,
+    status: str | None = None,
+    period: str | None = None,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """Return on_time / late / out_of_range counts for the selected report period."""
+
+    vn_day_names = {0: "T2", 1: "T3", 2: "T4", 3: "T5", 4: "T6", 5: "T7", 6: "CN"}
+
+    normalised_period = (period or "day").strip().lower()
+    if normalised_period not in {"day", "week", "month"}:
+        raise HTTPException(status_code=400, detail="period must be one of: day, week, month")
+
+    normalised_status = (status or "all").strip().lower()
+    if normalised_status not in {"", "all", "on_time", "late", "out_of_range"}:
+        raise HTTPException(status_code=400, detail="status must be one of: all, on_time, late, out_of_range")
+
+    def month_start(value: date) -> date:
+        return date(value.year, value.month, 1)
+
+    def month_end(value: date) -> date:
+        if value.month == 12:
+            return date(value.year, 12, 31)
+        return date(value.year, value.month + 1, 1) - timedelta(days=1)
+
+    def add_months(value: date, delta: int) -> date:
+        month_index = value.year * 12 + (value.month - 1) + delta
+        return date(month_index // 12, month_index % 12 + 1, 1)
+
+    buckets: list[tuple[date, str, str]] = []
+    bucket_by_date: dict[date, date] = {}
+
+    if normalised_period == "month":
+        selected_month = month_start(date_param)
+        start_date = add_months(selected_month, -5)
+        end_date = month_end(selected_month)
+        current = start_date
+        while current <= selected_month:
+            label = current.strftime("%m/%Y")
+            buckets.append((current, label, label))
+            current = add_months(current, 1)
+    else:
+        start_date = month_start(date_param)
+        end_date = month_end(date_param)
+        if normalised_period == "day":
+            current = start_date
+            while current <= end_date:
+                weekday_idx = current.weekday()
+                day_label = vn_day_names.get(weekday_idx, current.strftime("%d/%m"))
+                buckets.append((current, current.strftime("%d/%m"), f"{day_label} {current.strftime('%d/%m')}"))
+                current += timedelta(days=1)
+        else:
+            current = start_date
+            index = 1
+            while current <= end_date:
+                bucket_end = min(current + timedelta(days=6), end_date)
+                day = f"T{index}"
+                buckets.append((current, day, f"{day} {current.strftime('%d/%m')}-{bucket_end.strftime('%d/%m')}"))
+                current = bucket_end + timedelta(days=1)
+                index += 1
+
+    if normalised_period == "month":
+        current = start_date
+        while current <= end_date:
+            bucket_by_date[current] = month_start(current)
+            current += timedelta(days=1)
+    elif normalised_period == "week":
+        for bucket_start, _, _ in buckets:
+            bucket_end = min(bucket_start + timedelta(days=6), end_date)
+            current = bucket_start
+            while current <= bucket_end:
+                bucket_by_date[current] = bucket_start
+                current += timedelta(days=1)
+    else:
+        for bucket_start, _, _ in buckets:
+            bucket_by_date[bucket_start] = bucket_start
+
+    work_date_expr = _work_date_expr(db)
+
+    base_q = (
+        db.query(
+            work_date_expr.label("wd"),
+            AttendanceLog.punctuality_status,
+            AttendanceLog.is_out_of_range,
+        )
+        .join(Employee, Employee.id == AttendanceLog.employee_id)
+        .filter(
+            AttendanceLog.type == "IN",
+            work_date_expr >= start_date,
+            work_date_expr <= end_date,
+        )
+    )
+    if group_id:
+        base_q = base_q.filter(Employee.group_id == group_id)
+    if normalised_status == "on_time":
+        base_q = base_q.filter(AttendanceLog.punctuality_status.in_(("ON_TIME", "EARLY")))
+    elif normalised_status == "late":
+        base_q = base_q.filter(AttendanceLog.punctuality_status == "LATE")
+    elif normalised_status == "out_of_range":
+        base_q = base_q.filter(AttendanceLog.is_out_of_range.is_(True))
+
+    rows = base_q.all()
+
+    bucket_stats: dict[date, dict[str, int]] = {
+        key: {"on_time": 0, "late": 0, "out_of_range": 0} for key, _, _ in buckets
+    }
+
+    for row in rows:
+        wd = row.wd
+        if isinstance(wd, str):
+            wd = date.fromisoformat(wd)
+        elif isinstance(wd, datetime):
+            wd = wd.date()
+        bucket_key = bucket_by_date.get(wd)
+        if bucket_key is None:
+            continue
+        if row.punctuality_status == "ON_TIME" or row.punctuality_status == "EARLY":
+            bucket_stats[bucket_key]["on_time"] += 1
+        elif row.punctuality_status == "LATE":
+            bucket_stats[bucket_key]["late"] += 1
+        if row.is_out_of_range:
+            bucket_stats[bucket_key]["out_of_range"] += 1
+
+    result = []
+    for bucket_key, day, day_label in buckets:
+        stats = bucket_stats[bucket_key]
+        result.append({
+            "day": day,
+            "day_label": day_label,
+            "on_time": stats["on_time"],
+            "on_time_count": stats["on_time"],
+            "late": stats["late"],
+            "out_of_range": stats["out_of_range"],
+            "oor": stats["out_of_range"],
+        })
+
+    return result
+
+
+@router.get("/exceptions")
+def list_dashboard_exceptions(
+    status_filter: str = Query("pending", alias="status"),
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """Simplified exception list for the dashboard sidebar."""
+
+    q = (
+        db.query(
+            AttendanceException.id,
+            Employee.full_name,
+            AttendanceException.exception_type,
+            AttendanceException.status,
+            AttendanceException.created_at,
+        )
+        .join(Employee, Employee.id == AttendanceException.employee_id)
+    )
+
+    normalised = status_filter.strip().upper() if status_filter else ""
+    if normalised in {"PENDING", "OPEN"}:
+        q = q.filter(AttendanceException.status.in_(["OPEN", PENDING_EMPLOYEE, PENDING_ADMIN]))
+    elif normalised == "RESOLVED":
+        q = q.filter(AttendanceException.status.in_(["RESOLVED", APPROVED, REJECTED, EXPIRED]))
+    elif normalised in {PENDING_EMPLOYEE, PENDING_ADMIN, APPROVED, REJECTED, EXPIRED}:
+        q = q.filter(AttendanceException.status == normalised)
+
+    rows = q.order_by(AttendanceException.created_at.desc()).limit(20).all()
+
+    return [
+        {
+            "id": row.id,
+            "name": row.full_name,
+            "employee_name": row.full_name,
+            "full_name": row.full_name,
+            "reason": row.exception_type,
+            "exception_type": row.exception_type,
+            "status": normalize_exception_status(row.status).lower(),
+            "time": row.created_at.isoformat() if row.created_at else None,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+        for row in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+
+
+from pydantic import BaseModel as _BaseModel, Field as _Field
+
+
+class _ExportExcelBody(_BaseModel):
+    from_date: date | None = _Field(None, alias="from")
+    to_date: date | None = _Field(None, alias="to")
+    group_id: int | None = None
+    status: str | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+@router.post("/export-excel")
+def export_excel_via_post(
+    body: _ExportExcelBody,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """POST variant used by the Flutter dashboard CSV/Excel export button."""
+    return export_attendance_report_excel(
+        from_date=body.from_date,
+        to_date=body.to_date,
+        group_id=body.group_id,
+        status=body.status,
+        include_empty=True,
+        db=db,
+    )
+
+
 @router.get("/attendance.xlsx")
 def export_attendance_report_excel(
     from_date: date | None = Query(None, alias="from"),
     to_date: date | None = Query(None, alias="to"),
     employee_id: int | None = None,
     group_id: int | None = None,
+    status: str | None = None,
+    search: str | None = None,
     include_empty: bool = False,
     db: Session = Depends(get_db),
     _=Depends(require_admin),
@@ -463,10 +1077,44 @@ def export_attendance_report_excel(
             raise HTTPException(status_code=404, detail="group_id not found")
 
     rows = _fetch_daily_report_rows(db, from_date, to_date, employee_id, group_id)
+    exception_status_map = _build_exception_map(db, from_date, to_date, employee_id, group_id)
+    if status and status != "all":
+        normalised_filter = status.upper()
+        filtered_rows = []
+        for row in rows:
+            checkin_status, _checkout_status, attendance_state = _derive_daily_status(
+                row.checkin_time,
+                row.checkout_time,
+                row.punctuality_rank,
+                row.checkout_rank,
+                row.checkout_raw_status,
+            )
+            exc_status, exc_type = exception_status_map.get((row.employee_id, row.work_date), (None, None))
+            attendance_state = _apply_exception_to_attendance_state(attendance_state, exc_status, exc_type)
+            if normalised_filter == "ON_TIME" and checkin_status != "ON_TIME":
+                continue
+            if normalised_filter == "LATE" and checkin_status != "LATE":
+                continue
+            if normalised_filter == "EARLY" and checkin_status != "EARLY":
+                continue
+            if normalised_filter == "ABSENT" and attendance_state != "ABSENT":
+                continue
+            if normalised_filter == "OUT_OF_RANGE" and not row.out_of_range:
+                continue
+            filtered_rows.append(row)
+        rows = filtered_rows
+
+    if search and search.strip():
+        needle = search.strip().lower()
+        rows = [
+            row
+            for row in rows
+            if needle in f"{row.employee_code} {row.full_name} {row.group_name or ''}".lower()
+        ]
+
     if not rows and not include_empty:
         raise HTTPException(status_code=404, detail="No attendance data for selected filters")
 
-    exception_status_map = _build_exception_map(db, from_date, to_date, employee_id, group_id)
     active_rule = db.query(CheckinRule).filter(CheckinRule.active.is_(True)).first()
     fallback_radius_m = active_rule.radius_m if active_rule is not None else None
     group_ids = {int(row.group_id) for row in rows if row.group_id is not None}
@@ -646,17 +1294,29 @@ def list_attendance_exceptions(
     normalized_exception_type = exception_type.strip().upper()
     if normalized_exception_type == "GPS_RISK":
         normalized_exception_type = "SUSPECTED_LOCATION_SPOOF"
-    if normalized_exception_type not in {"MISSED_CHECKOUT", "AUTO_CLOSED", "SUSPECTED_LOCATION_SPOOF"}:
+    if normalized_exception_type not in {"MISSED_CHECKOUT", "AUTO_CLOSED", "SUSPECTED_LOCATION_SPOOF", "LARGE_TIME_DEVIATION"}:
         raise HTTPException(
             status_code=400,
-            detail="exception_type must be MISSED_CHECKOUT, AUTO_CLOSED or SUSPECTED_LOCATION_SPOOF",
+            detail="exception_type must be MISSED_CHECKOUT, AUTO_CLOSED, SUSPECTED_LOCATION_SPOOF or LARGE_TIME_DEVIATION",
         )
 
     normalized_status = status_filter.strip().upper() if status_filter else None
-    if normalized_status and normalized_status not in {"OPEN", "RESOLVED"}:
-        raise HTTPException(status_code=400, detail="status must be OPEN or RESOLVED")
+    if normalized_status == "OPEN":
+        normalized_statuses = [PENDING_EMPLOYEE]
+    elif normalized_status == "RESOLVED":
+        normalized_statuses = [APPROVED]
+    elif normalized_status == "PENDING":
+        normalized_statuses = [PENDING_EMPLOYEE, PENDING_ADMIN]
+    elif normalized_status:
+        try:
+            normalized_statuses = build_exception_status_filter_values([normalized_status])
+        except ValueError as exc_error:
+            raise HTTPException(status_code=400, detail=str(exc_error))
+    else:
+        normalized_statuses = None
 
     resolver = aliased(User)
+    decider = aliased(User)
 
     q = (
         db.query(
@@ -680,6 +1340,14 @@ def list_attendance_exceptions(
             AttendanceLog.risk_policy_version.label("risk_policy_version"),
             AttendanceException.actual_checkout_time.label("actual_checkout_time"),
             AttendanceException.created_at.label("created_at"),
+            AttendanceException.detected_at.label("detected_at"),
+            AttendanceException.expires_at.label("expires_at"),
+            AttendanceException.employee_explanation.label("employee_explanation"),
+            AttendanceException.employee_submitted_at.label("employee_submitted_at"),
+            AttendanceException.admin_note.label("admin_note"),
+            AttendanceException.admin_decided_at.label("admin_decided_at"),
+            AttendanceException.decided_by.label("decided_by"),
+            decider.email.label("decided_by_email"),
             AttendanceException.resolved_at.label("resolved_at"),
             AttendanceException.resolved_by.label("resolved_by"),
             resolver.email.label("resolved_by_email"),
@@ -687,6 +1355,7 @@ def list_attendance_exceptions(
         .join(Employee, Employee.id == AttendanceException.employee_id)
         .outerjoin(Group, Group.id == Employee.group_id)
         .outerjoin(AttendanceLog, AttendanceLog.id == AttendanceException.source_checkin_log_id)
+        .outerjoin(decider, decider.id == AttendanceException.decided_by)
         .outerjoin(resolver, resolver.id == AttendanceException.resolved_by)
     )
     if normalized_exception_type == "SUSPECTED_LOCATION_SPOOF":
@@ -702,8 +1371,13 @@ def list_attendance_exceptions(
         q = q.filter(AttendanceException.work_date >= from_date)
     if to_date:
         q = q.filter(AttendanceException.work_date <= to_date)
-    if normalized_status:
-        q = q.filter(AttendanceException.status == normalized_status)
+    if normalized_statuses:
+        status_options = list(normalized_statuses)
+        if PENDING_EMPLOYEE in normalized_statuses:
+            status_options.append("OPEN")
+        if APPROVED in normalized_statuses:
+            status_options.append("RESOLVED")
+        q = q.filter(AttendanceException.status.in_(status_options))
 
     rows = q.order_by(AttendanceException.work_date.desc(), AttendanceException.created_at.desc()).all()
 
@@ -717,7 +1391,7 @@ def list_attendance_exceptions(
             group_name=row.group_name,
             work_date=row.work_date,
             exception_type=_normalize_exception_type(row.exception_type),
-            status=row.status,
+            status=normalize_exception_status(row.status),
             note=row.note,
             resolved_note=row.resolved_note,
             risk_score=row.risk_score,
@@ -726,96 +1400,409 @@ def list_attendance_exceptions(
             risk_policy_version=row.risk_policy_version,
             source_checkin_log_id=row.source_checkin_log_id,
             source_checkin_time=row.source_checkin_time,
+            detected_at=row.detected_at,
+            expires_at=row.expires_at,
+            employee_explanation=row.employee_explanation,
+            employee_submitted_at=row.employee_submitted_at,
+            admin_note=row.admin_note,
+            admin_decided_at=row.admin_decided_at,
+            decided_by=row.decided_by,
+            decided_by_email=row.decided_by_email,
             actual_checkout_time=row.actual_checkout_time,
             created_at=row.created_at,
             resolved_at=row.resolved_at,
             resolved_by=row.resolved_by,
             resolved_by_email=row.resolved_by_email,
+            can_submit_explanation=_can_submit_explanation(row.status),
+            can_admin_decide=_can_admin_decide(row.status),
+            can_expire=_can_expire(row.status, row.expires_at),
         )
         for row in rows
     ]
 
 
-@router.patch("/attendance-exceptions/{exception_id}/resolve", response_model=AttendanceExceptionReportResponse)
-def resolve_attendance_exception(
+@router.get("/attendance-exceptions/me", response_model=list[AttendanceExceptionReportResponse])
+def list_my_attendance_exceptions(
+    status_filter: str | None = Query(None, alias="status"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    employee = _get_employee_for_user(db, current_user)
+
+    normalized_status = status_filter.strip().upper() if status_filter else None
+    if normalized_status == "OPEN":
+        normalized_statuses = [PENDING_EMPLOYEE]
+    elif normalized_status == "RESOLVED":
+        normalized_statuses = [APPROVED]
+    elif normalized_status == "PENDING":
+        normalized_statuses = [PENDING_EMPLOYEE, PENDING_ADMIN]
+    elif normalized_status:
+        try:
+            normalized_statuses = build_exception_status_filter_values([normalized_status])
+        except ValueError as exc_error:
+            raise HTTPException(status_code=400, detail=str(exc_error))
+    else:
+        normalized_statuses = None
+
+    q = db.query(AttendanceException.id).filter(AttendanceException.employee_id == employee.id)
+    if normalized_statuses:
+        status_options = list(normalized_statuses)
+        if PENDING_EMPLOYEE in normalized_statuses:
+            status_options.append("OPEN")
+        if APPROVED in normalized_statuses:
+            status_options.append("RESOLVED")
+        q = q.filter(AttendanceException.status.in_(status_options))
+
+    rows = q.order_by(AttendanceException.work_date.desc(), AttendanceException.created_at.desc()).all()
+    return [_build_exception_response(db, row.id) for row in rows]
+
+
+@router.get("/attendance-exceptions/me/{exception_id}", response_model=AttendanceExceptionDetailResponse)
+def get_my_attendance_exception_detail(
     exception_id: int,
-    payload: AttendanceExceptionResolveRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    employee = _get_employee_for_user(db, current_user)
+    exception = _get_exception_or_404(db, exception_id)
+    if exception.employee_id != employee.id:
+        raise HTTPException(status_code=403, detail="Employee can only view owned exception")
+    return _build_exception_response(db, exception.id)
+@router.get("/attendance-exceptions/{exception_id}", response_model=AttendanceExceptionDetailResponse)
+def get_attendance_exception_detail(
+    exception_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    return _build_exception_response(db, exception_id)
+
+
+@router.post("/attendance-exceptions/system", response_model=AttendanceExceptionDetailResponse)
+def create_attendance_exception(
+    payload: AttendanceExceptionCreateRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    _system_actor: str = Depends(require_exception_workflow_system),
+):
+    source_checkin = db.query(AttendanceLog).filter(AttendanceLog.id == payload.source_checkin_log_id).first()
+    if source_checkin is None:
+        raise HTTPException(status_code=400, detail="source_checkin_log_id not found")
+    if source_checkin.employee_id != payload.employee_id:
+        raise HTTPException(status_code=400, detail="source_checkin_log_id does not belong to employee_id")
+
+    employee = db.query(Employee).filter(Employee.id == payload.employee_id).first()
+    if employee is None:
+        raise HTTPException(status_code=404, detail="employee_id not found")
+
+    existing = (
+        db.query(AttendanceException)
+        .filter(AttendanceException.source_checkin_log_id == payload.source_checkin_log_id)
+        .first()
+    )
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="attendance_exception already exists for source_checkin_log_id")
+
+    detected_at = normalize_utc(payload.detected_at) if payload.detected_at is not None else datetime.now(timezone.utc)
+    initial_status = default_exception_status_for_type(payload.exception_type)
+    expires_at = normalize_utc(payload.expires_at) if payload.expires_at is not None else _default_expires_at(detected_at, initial_status)
+    if expires_at is not None and expires_at <= detected_at:
+        raise HTTPException(status_code=400, detail="expires_at must be later than detected_at")
+
+    exception = AttendanceException(
+        employee_id=payload.employee_id,
+        source_checkin_log_id=payload.source_checkin_log_id,
+        exception_type=payload.exception_type,
+        work_date=payload.work_date or source_checkin.work_date or source_checkin.time.date(),
+        status=initial_status,
+        note=_normalize_action_note(payload.note),
+        detected_at=detected_at,
+        expires_at=expires_at,
+    )
+    db.add(exception)
+    db.flush()
+    record_attendance_exception_audit(
+        db,
+        exception_id=exception.id,
+        event_type="exception_detected",
+        previous_status=None,
+        next_status=exception.status,
+        actor_type="SYSTEM",
+        actor_email="SYSTEM",
+        metadata={
+            "exception_type": exception.exception_type,
+            "source_checkin_log_id": exception.source_checkin_log_id,
+            "employee_id": exception.employee_id,
+        },
+    )
+    if exception.status == PENDING_EMPLOYEE:
+        _queue_employee_exception_notification(
+            background_tasks,
+            db,
+            event_type="exception_detected_employee",
+            exception=exception,
+            employee=employee,
+        )
+    elif exception.status == PENDING_ADMIN:
+        _queue_admin_exception_notifications(
+            background_tasks,
+            db,
+            event_type="exception_detected_admin",
+            exception=exception,
+            employee=employee,
+        )
+    db.commit()
+    db.refresh(exception)
+    return _build_exception_response(db, exception.id)
+
+
+@router.post("/attendance-exceptions/{exception_id}/submit-explanation", response_model=AttendanceExceptionDetailResponse)
+def submit_attendance_exception_explanation(
+    exception_id: int,
+    payload: AttendanceExceptionSubmitExplanationRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    employee = _get_employee_for_user(db, current_user)
+    exception = _get_exception_or_404(db, exception_id)
+    if exception.employee_id != employee.id:
+        raise HTTPException(status_code=403, detail="Employee can only submit explanation for owned exception")
+
+    explanation = payload.explanation.strip()
+    if not explanation:
+        raise HTTPException(status_code=400, detail="explanation must not be empty")
+
+    previous_status = exception.status
+    try:
+        exception.status = ensure_allowed_exception_transition(exception.status, PENDING_ADMIN)
+    except ValueError as exc_error:
+        raise HTTPException(status_code=409, detail=str(exc_error))
+
+    submitted_at = datetime.now(timezone.utc)
+    exception.employee_explanation = explanation
+    exception.employee_submitted_at = submitted_at
+    record_attendance_exception_audit(
+        db,
+        exception_id=exception.id,
+        event_type="employee_explanation_submitted",
+        previous_status=previous_status,
+        next_status=exception.status,
+        actor_type="EMPLOYEE",
+        actor_id=current_user.id,
+        actor_email=current_user.email,
+        metadata={
+            "employee_id": employee.id,
+            "employee_submitted_at": submitted_at.isoformat(),
+        },
+    )
+    _queue_admin_exception_notifications(
+        background_tasks,
+        db,
+        event_type="exception_submitted_admin",
+        exception=exception,
+        employee=employee,
+        extra_metadata={
+            "employee_explanation": explanation,
+            "employee_submitted_at": submitted_at.isoformat(),
+        },
+    )
+    db.commit()
+    return _build_exception_response(db, exception.id)
+
+
+@router.post("/attendance-exceptions/{exception_id}/approve", response_model=AttendanceExceptionDetailResponse)
+def approve_attendance_exception(
+    exception_id: int,
+    payload: AttendanceExceptionApproveRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     admin_user: User = Depends(require_admin),
 ):
-    exception = db.query(AttendanceException).filter(AttendanceException.id == exception_id).first()
-    if exception is None:
-        raise HTTPException(status_code=404, detail="attendance_exception not found")
-
+    exception = _get_exception_or_404(db, exception_id)
     source_checkin = db.query(AttendanceLog).filter(AttendanceLog.id == exception.source_checkin_log_id).first()
     if source_checkin is None:
         raise HTTPException(status_code=400, detail="source check-in log not found")
+
     normalized_exception_type = _normalize_exception_type(exception.exception_type)
-    if normalized_exception_type == "SUSPECTED_LOCATION_SPOOF":
-        if payload.note is None or not payload.note.strip():
-            raise HTTPException(status_code=400, detail="note is required for SUSPECTED_LOCATION_SPOOF resolve")
-
-    if normalized_exception_type in {"AUTO_CLOSED", "MISSED_CHECKOUT"}:
-        if payload.actual_checkout_time is None:
-            if normalized_exception_type == "AUTO_CLOSED":
-                raise HTTPException(status_code=400, detail="actual_checkout_time is required for AUTO_CLOSED")
-            raise HTTPException(status_code=400, detail="actual_checkout_time is required for MISSED_CHECKOUT")
-
+    if normalized_exception_type in {"AUTO_CLOSED", "MISSED_CHECKOUT"} and payload.actual_checkout_time is not None:
         actual_checkout_utc = normalize_utc(payload.actual_checkout_time)
         if actual_checkout_utc <= normalize_utc(source_checkin.time):
             raise HTTPException(status_code=400, detail="actual_checkout_time must be later than source check-in time")
-
         _upsert_checkout_log_from_resolution(db, exception, source_checkin, actual_checkout_utc)
         exception.actual_checkout_time = actual_checkout_utc
-    else:
-        exception.actual_checkout_time = payload.actual_checkout_time
 
-    exception.status = "RESOLVED"
+    previous_status = exception.status
+    try:
+        exception.status = ensure_allowed_exception_transition(exception.status, APPROVED)
+    except ValueError as exc_error:
+        raise HTTPException(status_code=409, detail=str(exc_error))
+
+    decision_time = datetime.now(timezone.utc)
+    note = _normalize_action_note(payload.admin_note)
+    exception.admin_note = note
+    exception.admin_decided_at = decision_time
+    exception.decided_by = admin_user.id
     exception.resolved_by = admin_user.id
-    exception.resolved_at = datetime.now(timezone.utc)
-    exception.resolved_note = payload.note.strip() if payload.note is not None else None
-    if payload.note is not None and normalized_exception_type != "SUSPECTED_LOCATION_SPOOF":
-        exception.note = payload.note
-
+    exception.resolved_at = decision_time
+    exception.resolved_note = note
+    record_attendance_exception_audit(
+        db,
+        exception_id=exception.id,
+        event_type="admin_approved",
+        previous_status=previous_status,
+        next_status=exception.status,
+        actor_type="ADMIN",
+        actor_id=admin_user.id,
+        actor_email=admin_user.email,
+        metadata={
+            "admin_decided_at": decision_time.isoformat(),
+            "actual_checkout_time": exception.actual_checkout_time.isoformat() if exception.actual_checkout_time else None,
+        },
+    )
+    employee = db.query(Employee).filter(Employee.id == exception.employee_id).first()
+    if employee is not None:
+        _queue_employee_exception_notification(
+            background_tasks,
+            db,
+            event_type="exception_approved_employee",
+            exception=exception,
+            employee=employee,
+            admin_user=admin_user,
+        )
     db.commit()
-    return _build_exception_response(db, exception_id)
+    return _build_exception_response(db, exception.id)
 
 
-@router.patch("/attendance-exceptions/{exception_id}/reopen", response_model=AttendanceExceptionReportResponse)
+@router.post("/attendance-exceptions/{exception_id}/reject", response_model=AttendanceExceptionDetailResponse)
+def reject_attendance_exception(
+    exception_id: int,
+    payload: AttendanceExceptionRejectRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    exception = _get_exception_or_404(db, exception_id)
+    admin_note = payload.admin_note.strip()
+    if not admin_note:
+        raise HTTPException(status_code=400, detail="admin_note is required")
+
+    previous_status = exception.status
+    try:
+        exception.status = ensure_allowed_exception_transition(exception.status, REJECTED)
+    except ValueError as exc_error:
+        raise HTTPException(status_code=409, detail=str(exc_error))
+
+    decision_time = datetime.now(timezone.utc)
+    exception.admin_note = admin_note
+    exception.admin_decided_at = decision_time
+    exception.decided_by = admin_user.id
+    exception.resolved_by = admin_user.id
+    exception.resolved_at = decision_time
+    exception.resolved_note = admin_note
+    record_attendance_exception_audit(
+        db,
+        exception_id=exception.id,
+        event_type="admin_rejected",
+        previous_status=previous_status,
+        next_status=exception.status,
+        actor_type="ADMIN",
+        actor_id=admin_user.id,
+        actor_email=admin_user.email,
+        metadata={
+            "admin_decided_at": decision_time.isoformat(),
+        },
+    )
+    employee = db.query(Employee).filter(Employee.id == exception.employee_id).first()
+    if employee is not None:
+        _queue_employee_exception_notification(
+            background_tasks,
+            db,
+            event_type="exception_rejected_employee",
+            exception=exception,
+            employee=employee,
+            admin_user=admin_user,
+        )
+    db.commit()
+    return _build_exception_response(db, exception.id)
+
+
+@router.post("/attendance-exceptions/{exception_id}/expire", response_model=AttendanceExceptionDetailResponse)
+def expire_attendance_exception(
+    exception_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    _system_actor: str = Depends(require_exception_workflow_system),
+):
+    exception = _get_exception_or_404(db, exception_id)
+    if exception.expires_at is None:
+        raise HTTPException(status_code=400, detail="expires_at is required to expire exception")
+
+    now_utc = datetime.now(timezone.utc)
+    if normalize_utc(exception.expires_at) > now_utc:
+        raise HTTPException(status_code=400, detail="Exception cannot be expired before expires_at")
+
+    previous_status = exception.status
+    try:
+        exception.status = ensure_allowed_exception_transition(exception.status, EXPIRED)
+    except ValueError as exc_error:
+        raise HTTPException(status_code=409, detail=str(exc_error))
+
+    record_attendance_exception_audit(
+        db,
+        exception_id=exception.id,
+        event_type="system_expired",
+        previous_status=previous_status,
+        next_status=exception.status,
+        actor_type="SYSTEM",
+        actor_email="SYSTEM",
+        metadata={
+            "expired_at": now_utc.isoformat(),
+            "expires_at": normalize_utc(exception.expires_at).isoformat(),
+        },
+    )
+    employee = db.query(Employee).filter(Employee.id == exception.employee_id).first()
+    if employee is not None:
+        _queue_employee_exception_notification(
+            background_tasks,
+            db,
+            event_type="exception_expired_employee",
+            exception=exception,
+            employee=employee,
+            extra_metadata={
+                "expired_at": now_utc.isoformat(),
+            },
+        )
+    db.commit()
+    return _build_exception_response(db, exception.id)
+
+
+@router.patch("/attendance-exceptions/{exception_id}/resolve", response_model=AttendanceExceptionDetailResponse)
+def resolve_attendance_exception(
+    exception_id: int,
+    payload: AttendanceExceptionResolveRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    return approve_attendance_exception(
+        exception_id=exception_id,
+        payload=AttendanceExceptionApproveRequest(
+            admin_note=payload.note,
+            actual_checkout_time=payload.actual_checkout_time,
+        ),
+        background_tasks=background_tasks,
+        db=db,
+        admin_user=admin_user,
+    )
+
+
+@router.patch("/attendance-exceptions/{exception_id}/reopen", response_model=AttendanceExceptionDetailResponse)
 def reopen_attendance_exception(
     exception_id: int,
-    payload: AttendanceExceptionReopenRequest,
     db: Session = Depends(get_db),
     _admin_user: User = Depends(require_admin),
 ):
-    exception = db.query(AttendanceException).filter(AttendanceException.id == exception_id).first()
-    if exception is None:
-        raise HTTPException(status_code=404, detail="attendance_exception not found")
-
-    source_checkin = db.query(AttendanceLog).filter(AttendanceLog.id == exception.source_checkin_log_id).first()
-    if source_checkin is None:
-        raise HTTPException(status_code=400, detail="source check-in log not found")
-
-    _revert_checkout_log_for_reopen(db, exception, source_checkin)
-
-    exception.status = "OPEN"
-    exception.resolved_by = None
-    exception.resolved_at = None
-    exception.resolved_note = None
-    exception.actual_checkout_time = None
-    if payload.note is not None:
-        exception.note = payload.note
-
-    db.commit()
-    return _build_exception_response(db, exception_id)
-
-
-
-
-
-
-
-
-
-
-
+    raise HTTPException(
+        status_code=409,
+        detail="Legacy reopen flow is disabled in the new exception workflow",
+    )
