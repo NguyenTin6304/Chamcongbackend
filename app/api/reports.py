@@ -845,8 +845,8 @@ def get_weekly_trends(
     vn_day_names = {0: "T2", 1: "T3", 2: "T4", 3: "T5", 4: "T6", 5: "T7", 6: "CN"}
 
     normalised_period = (period or "day").strip().lower()
-    if normalised_period not in {"day", "week", "month"}:
-        raise HTTPException(status_code=400, detail="period must be one of: day, week, month")
+    if normalised_period not in {"day", "week", "month", "weekday"}:
+        raise HTTPException(status_code=400, detail="period must be one of: day, week, month, weekday")
 
     normalised_status = (status or "all").strip().lower()
     if normalised_status not in {"", "all", "on_time", "late", "out_of_range"}:
@@ -864,8 +864,8 @@ def get_weekly_trends(
         month_index = value.year * 12 + (value.month - 1) + delta
         return date(month_index // 12, month_index % 12 + 1, 1)
 
-    buckets: list[tuple[date, str, str]] = []
-    bucket_by_date: dict[date, date] = {}
+    buckets: list[tuple[object, str, str]] = []
+    bucket_by_date: dict[date, object] = {}
 
     if normalised_period == "month":
         selected_month = month_start(date_param)
@@ -876,6 +876,19 @@ def get_weekly_trends(
             label = current.strftime("%m/%Y")
             buckets.append((current, label, label))
             current = add_months(current, 1)
+    elif normalised_period == "weekday":
+        start_date = month_start(date_param)
+        end_date = month_end(date_param)
+        weekday_buckets = (
+            (0, "T2"),
+            (1, "T3"),
+            (2, "T4"),
+            (3, "T5"),
+            (4, "T6"),
+            (5, "T7"),
+        )
+        for weekday_index, label in weekday_buckets:
+            buckets.append((weekday_index, label, label))
     else:
         start_date = month_start(date_param)
         end_date = month_end(date_param)
@@ -900,6 +913,13 @@ def get_weekly_trends(
         current = start_date
         while current <= end_date:
             bucket_by_date[current] = month_start(current)
+            current += timedelta(days=1)
+    elif normalised_period == "weekday":
+        current = start_date
+        while current <= end_date:
+            weekday_index = current.weekday()
+            if 0 <= weekday_index <= 5:
+                bucket_by_date[current] = weekday_index
             current += timedelta(days=1)
     elif normalised_period == "week":
         for bucket_start, _, _ in buckets:
@@ -938,7 +958,7 @@ def get_weekly_trends(
 
     rows = base_q.all()
 
-    bucket_stats: dict[date, dict[str, int]] = {
+    bucket_stats: dict[object, dict[str, int]] = {
         key: {"on_time": 0, "late": 0, "out_of_range": 0} for key, _, _ in buckets
     }
 

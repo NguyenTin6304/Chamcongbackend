@@ -123,16 +123,16 @@ def _to_decision(score: int) -> LocationRiskDecision:
 
 def _build_user_message(level: LocationRiskLevel, flags: list[str]) -> str:
     if level == "LOW":
-        return "Vi tri hop le. Ban co the tiep tuc cham cong."
+        return "Vị trí hợp lệ bạn có thể tiếp tục chấm công."
     if level == "MEDIUM":
         return (
-            "He thong van ghi nhan cham cong nhung phat hien tin hieu rui ro vi tri. "
-            "Vui long tat VPN/fake GPS va bat dinh vi chinh xac."
+            "Hệ thống vẫn ghi nhận chấm công nhưng phát hiện tín hiệu rủi ro vị trí. "
+            "Vui lòng tắt VPN/fake GPS và bật định vị chính xác."
         )
     flag_preview = ", ".join(flags[:3]) if flags else "HIGH_RISK"
     return (
-        "He thong tam tu choi cham cong do rui ro vi tri cao. "
-        f"Dau hieu: {flag_preview}. Vui long xac minh lai thiet bi/mang."
+        "Hệ thống tạm thời từ chối chấm công do rủi ro vị trí cao. "
+        f"Dấu hiệu: {flag_preview}. Vui lòng xác minh lại thiết bị/mạng."
     )
 
 
