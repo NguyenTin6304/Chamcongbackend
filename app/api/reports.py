@@ -786,7 +786,7 @@ def list_attendance_logs_for_dashboard(
         total_hours = "--"
         if row.checkin_time and row.checkout_time:
             delta = row.checkout_time - row.checkin_time
-            hours = delta.total_seconds() / 3600
+            hours = max(0.0, delta.total_seconds() / 3600)
             total_hours = f"{hours:.1f}h"
 
         out_of_range_val = bool(row.out_of_range) if row.out_of_range is not None else False
