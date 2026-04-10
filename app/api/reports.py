@@ -640,7 +640,7 @@ def _to_excel_datetime(value: datetime | str | None) -> str | None:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC_TZ)
 
-    return value.astimezone(VN_TZ).isoformat(sep=" ", timespec="seconds")
+    return value.astimezone(VN_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ---------------------------------------------------------------------------
