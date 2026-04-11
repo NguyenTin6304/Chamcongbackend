@@ -93,7 +93,22 @@ def my_employee_profile(
     emp = db.query(Employee).filter(Employee.user_id == user.id).first()
     if not emp:
         raise HTTPException(status_code=404, detail="Ban chua duoc gan Employee")
-    return emp
+
+    group_name: str | None = None
+    if emp.group_id is not None:
+        group = db.query(Group).filter(Group.id == emp.group_id).first()
+        if group:
+            group_name = group.name
+
+    return EmployeeResponse(
+        id=emp.id,
+        code=emp.code,
+        full_name=emp.full_name,
+        user_id=emp.user_id,
+        group_id=emp.group_id,
+        group_name=group_name,
+        joined_at=emp.created_at,
+    )
 
 
 @router.put("/{employee_id}", response_model=EmployeeResponse)

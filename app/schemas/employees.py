@@ -1,4 +1,5 @@
-﻿from typing import Optional
+﻿from datetime import datetime
+from typing import Optional
 
 from pydantic import BaseModel
 
@@ -30,6 +31,8 @@ class EmployeeResponse(BaseModel):
     full_name: str
     user_id: Optional[int] = None
     group_id: Optional[int] = None
+    group_name: Optional[str] = None
+    joined_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
