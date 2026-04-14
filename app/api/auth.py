@@ -19,6 +19,7 @@ from app.core.security import (
 )
 from app.models import RefreshToken, User
 from app.schemas.auth import (
+    ChangePasswordRequest,
     ForgotPasswordRequest,
     LoginRequest,
     MessageResponse,
@@ -318,3 +319,24 @@ def me(current_user: User = Depends(get_current_user)):
         full_name=current_user.full_name,
         phone=current_user.phone,
     )
+
+
+@router.post("/change-password", response_model=MessageResponse)
+def change_password(
+    payload: ChangePasswordRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not verify_password(payload.current_password, current_user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Mật khẩu hiện tại không đúng",
+        )
+    if payload.new_password == payload.current_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Mật khẩu mới phải khác mật khẩu hiện tại",
+        )
+    current_user.password_hash = hash_password(payload.new_password)
+    db.commit()
+    return MessageResponse(message="Đổi mật khẩu thành công")
