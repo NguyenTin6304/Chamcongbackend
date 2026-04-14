@@ -1,4 +1,5 @@
-﻿from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
@@ -21,7 +22,13 @@ def list_users(
 
     if q:
         like = f"%{q}%"
-        query = query.filter(User.email.ilike(like))
+        query = query.filter(
+            or_(
+                User.email.ilike(like),
+                User.full_name.ilike(like),
+                User.phone.ilike(like),
+            )
+        )
 
     if role:
         query = query.filter(User.role == role.upper())
@@ -30,6 +37,12 @@ def list_users(
 
     users = query.order_by(User.id.desc()).limit(safe_limit).all()
     return [
-        UserLiteResponse(id=u.id, email=u.email, role=u.role)
+        UserLiteResponse(
+            id=u.id,
+            email=u.email,
+            role=u.role,
+            full_name=u.full_name,
+            phone=u.phone,
+        )
         for u in users
     ]

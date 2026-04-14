@@ -19,6 +19,7 @@ from app.core.security import (
 )
 from app.models import RefreshToken, User
 from app.schemas.auth import (
+    ChangePasswordRequest,
     ForgotPasswordRequest,
     LoginRequest,
     MessageResponse,
@@ -103,14 +104,22 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
             email=payload.email,
             password_hash=hash_password(payload.password),
             role="USER",
+            full_name=payload.full_name,
+            phone=payload.phone,
         )
         db.add(user)
         db.commit()
         db.refresh(user)
-        return RegisterResponse(id=user.id, email=user.email, role=user.role)
+        return RegisterResponse(
+            id=user.id,
+            email=user.email,
+            role=user.role,
+            full_name=user.full_name,
+            phone=user.phone,
+        )
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=400, detail="Email đã tồn tại hãy thử với email khác")
+        raise HTTPException(status_code=400, detail="Email đã tồn tại hãy thử email khác")
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -239,7 +248,7 @@ def refresh(payload: RefreshTokenRequest, db: Session = Depends(get_db)):
     if not user:
         refresh_row.revoked_at = now_cmp
         db.commit()
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User không tìm thấy")
 
     tokens = _issue_tokens(db, user, remember_me=refresh_row.remember_me)
 
@@ -303,4 +312,31 @@ def logout_all(db: Session = Depends(get_db), current_user: User = Depends(get_c
 
 @router.get("/me", response_model=UserMeResponse)
 def me(current_user: User = Depends(get_current_user)):
-    return UserMeResponse(id=current_user.id, email=current_user.email, role=current_user.role)
+    return UserMeResponse(
+        id=current_user.id,
+        email=current_user.email,
+        role=current_user.role,
+        full_name=current_user.full_name,
+        phone=current_user.phone,
+    )
+
+
+@router.post("/change-password", response_model=MessageResponse)
+def change_password(
+    payload: ChangePasswordRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not verify_password(payload.current_password, current_user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Mật khẩu hiện tại không đúng",
+        )
+    if payload.new_password == payload.current_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Mật khẩu mới phải khác mật khẩu hiện tại",
+        )
+    current_user.password_hash = hash_password(payload.new_password)
+    db.commit()
+    return MessageResponse(message="Đổi mật khẩu thành công")

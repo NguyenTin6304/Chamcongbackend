@@ -7,17 +7,18 @@ from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
-from sqlalchemy import case, func
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.orm import Session, aliased
 
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_admin, require_exception_workflow_system
-from app.models import AttendanceException, AttendanceExceptionAudit, AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, User
+from app.models import AttendanceException, AttendanceExceptionAudit, AttendanceExceptionNotification, AttendanceLog, CheckinRule, Employee, ExceptionPolicy, Group, GroupGeofence, User
 from app.schemas.attendance import (
     AttendanceExceptionApproveRequest,
     AttendanceExceptionAuditResponse,
     AttendanceExceptionCreateRequest,
     AttendanceExceptionDetailResponse,
+    AttendanceExceptionExtendDeadlineRequest,
     AttendanceExceptionRejectRequest,
     AttendanceExceptionReportResponse,
     AttendanceExceptionResolveRequest,
@@ -29,9 +30,12 @@ from app.services.attendance_exception_workflow import (
     PENDING_ADMIN,
     PENDING_EMPLOYEE,
     REJECTED,
+    auto_expire_overdue,
     default_exception_status_for_type,
     build_exception_status_filter_values,
     ensure_allowed_exception_transition,
+    get_deadline_hours,
+    get_effective_deadline,
     is_pending_exception_status,
     is_pending_timesheet_exception,
     normalize_exception_status,
@@ -453,6 +457,7 @@ def _build_exception_response(db: Session, exception_id: int) -> AttendanceExcep
             AttendanceLog.risk_flags.label("risk_flags"),
             AttendanceLog.risk_policy_version.label("risk_policy_version"),
             AttendanceException.actual_checkout_time.label("actual_checkout_time"),
+            AttendanceException.extended_deadline_at.label("extended_deadline_at"),
             AttendanceException.created_at.label("created_at"),
             AttendanceException.detected_at.label("detected_at"),
             AttendanceException.expires_at.label("expires_at"),
@@ -498,6 +503,7 @@ def _build_exception_response(db: Session, exception_id: int) -> AttendanceExcep
         source_checkin_time=row.source_checkin_time,
         detected_at=row.detected_at,
         expires_at=row.expires_at,
+        extended_deadline_at=row.extended_deadline_at,
         employee_explanation=row.employee_explanation,
         employee_submitted_at=row.employee_submitted_at,
         admin_note=row.admin_note,
@@ -613,10 +619,46 @@ def _normalize_action_note(value: str | None) -> str | None:
     return normalized or None
 
 
-def _default_expires_at(detected_at: datetime, status: str) -> datetime | None:
+def _default_expires_at(detected_at: datetime, status: str, exception_type: str | None = None, db: Session | None = None) -> datetime | None:
+    """Calculate expires_at for a new exception using the configured policy."""
     if status != PENDING_EMPLOYEE:
         return None
-    return detected_at + timedelta(days=3)
+    hours = 72  # fallback if no DB / no policy
+    if db is not None and exception_type is not None:
+        policy = db.query(ExceptionPolicy).filter(ExceptionPolicy.id == 1).first()
+        if policy is not None:
+            hours = get_deadline_hours(policy, exception_type)
+    return detected_at + timedelta(hours=hours)
+
+
+def _expire_overdue_now(db: Session) -> int:
+    """Bulk-expire all PENDING_EMPLOYEE exceptions whose effective deadline has passed.
+
+    Effective deadline = extended_deadline_at if set, else expires_at.
+    Returns number of records expired.
+    """
+    now = datetime.now(timezone.utc)
+    count = (
+        db.query(AttendanceException)
+        .filter(
+            AttendanceException.status == PENDING_EMPLOYEE,
+            or_(
+                and_(
+                    AttendanceException.extended_deadline_at.isnot(None),
+                    AttendanceException.extended_deadline_at < now,
+                ),
+                and_(
+                    AttendanceException.extended_deadline_at.is_(None),
+                    AttendanceException.expires_at.isnot(None),
+                    AttendanceException.expires_at < now,
+                ),
+            ),
+        )
+        .update({"status": EXPIRED}, synchronize_session="evaluate")
+    )
+    if count > 0:
+        db.flush()
+    return count
 
 def _to_excel_date(value: date | datetime | str | None) -> str | None:
     if value is None:
@@ -1335,6 +1377,9 @@ def list_attendance_exceptions(
     else:
         normalized_statuses = None
 
+    # Lazy expiry: flip any overdue PENDING_EMPLOYEE to EXPIRED before querying
+    _expire_overdue_now(db)
+
     resolver = aliased(User)
     decider = aliased(User)
 
@@ -1359,6 +1404,7 @@ def list_attendance_exceptions(
             AttendanceLog.risk_flags.label("risk_flags"),
             AttendanceLog.risk_policy_version.label("risk_policy_version"),
             AttendanceException.actual_checkout_time.label("actual_checkout_time"),
+            AttendanceException.extended_deadline_at.label("extended_deadline_at"),
             AttendanceException.created_at.label("created_at"),
             AttendanceException.detected_at.label("detected_at"),
             AttendanceException.expires_at.label("expires_at"),
@@ -1422,6 +1468,7 @@ def list_attendance_exceptions(
             source_checkin_time=row.source_checkin_time,
             detected_at=row.detected_at,
             expires_at=row.expires_at,
+            extended_deadline_at=row.extended_deadline_at,
             employee_explanation=row.employee_explanation,
             employee_submitted_at=row.employee_submitted_at,
             admin_note=row.admin_note,
@@ -1464,6 +1511,9 @@ def list_my_attendance_exceptions(
     else:
         normalized_statuses = None
 
+    # Lazy expiry: flip any overdue PENDING_EMPLOYEE to EXPIRED before querying
+    _expire_overdue_now(db)
+
     q = db.query(AttendanceException.id).filter(AttendanceException.employee_id == employee.id)
     if normalized_statuses:
         status_options = list(normalized_statuses)
@@ -1487,14 +1537,19 @@ def get_my_attendance_exception_detail(
     exception = _get_exception_or_404(db, exception_id)
     if exception.employee_id != employee.id:
         raise HTTPException(status_code=403, detail="Employee can only view owned exception")
+    auto_expire_overdue(db, [exception])
     return _build_exception_response(db, exception.id)
+
+
 @router.get("/attendance-exceptions/{exception_id}", response_model=AttendanceExceptionDetailResponse)
 def get_attendance_exception_detail(
     exception_id: int,
     db: Session = Depends(get_db),
     _=Depends(require_admin),
 ):
-    return _build_exception_response(db, exception_id)
+    exception = _get_exception_or_404(db, exception_id)
+    auto_expire_overdue(db, [exception])
+    return _build_exception_response(db, exception.id)
 
 
 @router.post("/attendance-exceptions/system", response_model=AttendanceExceptionDetailResponse)
@@ -1524,7 +1579,7 @@ def create_attendance_exception(
 
     detected_at = normalize_utc(payload.detected_at) if payload.detected_at is not None else datetime.now(timezone.utc)
     initial_status = default_exception_status_for_type(payload.exception_type)
-    expires_at = normalize_utc(payload.expires_at) if payload.expires_at is not None else _default_expires_at(detected_at, initial_status)
+    expires_at = normalize_utc(payload.expires_at) if payload.expires_at is not None else _default_expires_at(detected_at, initial_status, payload.exception_type, db)
     if expires_at is not None and expires_at <= detected_at:
         raise HTTPException(status_code=400, detail="expires_at must be later than detected_at")
 
@@ -1591,6 +1646,16 @@ def submit_attendance_exception_explanation(
     explanation = payload.explanation.strip()
     if not explanation:
         raise HTTPException(status_code=400, detail="explanation must not be empty")
+
+    # Block submission after effective deadline
+    effective_deadline = get_effective_deadline(exception)
+    if effective_deadline is not None:
+        now_utc = datetime.now(timezone.utc)
+        deadline_utc = effective_deadline if effective_deadline.tzinfo else effective_deadline.replace(tzinfo=timezone.utc)
+        if now_utc > deadline_utc:
+            exception.status = EXPIRED
+            db.flush()
+            raise HTTPException(status_code=410, detail="Đã quá hạn giải trình. Vui lòng liên hệ quản trị viên để được gia hạn.")
 
     previous_status = exception.status
     try:
@@ -1826,3 +1891,118 @@ def reopen_attendance_exception(
         status_code=409,
         detail="Legacy reopen flow is disabled in the new exception workflow",
     )
+
+
+@router.patch("/attendance-exceptions/{exception_id}/extend-deadline", response_model=AttendanceExceptionDetailResponse)
+def extend_exception_deadline(
+    exception_id: int,
+    payload: AttendanceExceptionExtendDeadlineRequest,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """Extend the explanation deadline for a single exception.
+
+    Allowed for PENDING_EMPLOYEE and EXPIRED exceptions.
+    If exception is currently EXPIRED, it is revived back to PENDING_EMPLOYEE.
+    The new deadline is: effective_deadline + extend_hours (forward from current deadline).
+    """
+    exception = _get_exception_or_404(db, exception_id)
+
+    if exception.status not in (PENDING_EMPLOYEE, EXPIRED):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot extend deadline for exception in status {exception.status}. Only PENDING_EMPLOYEE or EXPIRED allowed.",
+        )
+
+    # Compute the current effective deadline (starting point for extension)
+    current_deadline = get_effective_deadline(exception)
+    now_utc = datetime.now(timezone.utc)
+
+    if current_deadline is None:
+        # No deadline set — start from now
+        base = now_utc
+    else:
+        deadline_utc = current_deadline if current_deadline.tzinfo else current_deadline.replace(tzinfo=timezone.utc)
+        # If deadline is still in the future, extend from there; otherwise extend from now
+        base = max(deadline_utc, now_utc)
+
+    new_deadline = base + timedelta(hours=payload.extend_hours)
+    exception.extended_deadline_at = new_deadline
+
+    # Revive EXPIRED exceptions back to PENDING_EMPLOYEE
+    if exception.status == EXPIRED:
+        exception.status = PENDING_EMPLOYEE
+
+    db.flush()
+    db.commit()
+    return _build_exception_response(db, exception.id)
+
+
+@router.post("/attendance-exceptions/batch-expire", response_model=dict)
+def batch_expire_attendance_exceptions(
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """Manually trigger lazy expiry for all overdue PENDING_EMPLOYEE exceptions.
+
+    Useful for admin dashboards or scheduled reconciliation.
+    Returns { "expired_count": N }.
+    """
+    count = _expire_overdue_now(db)
+    db.commit()
+    return {"expired_count": count}
+
+
+@router.post("/attendance-exceptions/purge-expired", response_model=dict)
+def purge_expired_attendance_exceptions(
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """Delete EXPIRED exceptions whose retention grace period has passed."""
+    expired_count = _expire_overdue_now(db)
+    policy = db.query(ExceptionPolicy).filter(ExceptionPolicy.id == 1).first()
+    grace_period_days = policy.grace_period_days if policy is not None else 30
+    cutoff = datetime.now(timezone.utc) - timedelta(days=grace_period_days)
+
+    rows = (
+        db.query(AttendanceException.id)
+        .filter(
+            AttendanceException.status == EXPIRED,
+            or_(
+                and_(
+                    AttendanceException.extended_deadline_at.isnot(None),
+                    AttendanceException.extended_deadline_at < cutoff,
+                ),
+                and_(
+                    AttendanceException.extended_deadline_at.is_(None),
+                    AttendanceException.expires_at.isnot(None),
+                    AttendanceException.expires_at < cutoff,
+                ),
+            ),
+        )
+        .all()
+    )
+    ids = [row.id for row in rows]
+    if not ids:
+        db.commit()
+        return {
+            "deleted_count": 0,
+            "expired_count": expired_count,
+            "grace_period_days": grace_period_days,
+        }
+
+    db.query(AttendanceExceptionNotification).filter(
+        AttendanceExceptionNotification.exception_id.in_(ids)
+    ).delete(synchronize_session=False)
+    db.query(AttendanceExceptionAudit).filter(
+        AttendanceExceptionAudit.exception_id.in_(ids)
+    ).delete(synchronize_session=False)
+    db.query(AttendanceException).filter(
+        AttendanceException.id.in_(ids)
+    ).delete(synchronize_session=False)
+    db.commit()
+    return {
+        "deleted_count": len(ids),
+        "expired_count": expired_count,
+        "grace_period_days": grace_period_days,
+    }

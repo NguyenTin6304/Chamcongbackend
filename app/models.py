@@ -13,6 +13,8 @@ class User(Base):
     email = Column(String(255), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
     role = Column(String(50), default="USER", nullable=False)
+    full_name = Column(String(255), nullable=True)
+    phone = Column(String(32), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -77,10 +79,23 @@ class Employee(Base):
     id = Column(Integer, primary_key=True)
     code = Column(String(50), unique=True, index=True, nullable=False)
     full_name = Column(String(255), nullable=False)
+    phone = Column(String(32), nullable=True)
     # Nullable + unique allows many NULL rows in PostgreSQL, but prevents 1 user linked to many employees.
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True, unique=True)
     group_id = Column(Integer, ForeignKey("groups.id"), nullable=True, index=True)
+    active = Column(Boolean, default=True, nullable=False, server_default="true")
+    deleted_at = Column(DateTime(timezone=True), nullable=True, default=None)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    @property
+    def resigned_at(self):
+        """Alias for deleted_at — exposed in API responses as resigned_at."""
+        return self.deleted_at
+
+    @property
+    def joined_at(self):
+        """Alias for created_at — exposed in API responses as joined_at."""
+        return self.created_at
 
 
 class CheckinRule(Base):
@@ -170,6 +185,7 @@ class AttendanceException(Base):
     note = Column(Text, nullable=True)
     resolved_note = Column(Text, nullable=True)
     actual_checkout_time = Column(DateTime(timezone=True), nullable=True)
+    extended_deadline_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     resolved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     resolved_at = Column(DateTime(timezone=True), nullable=True)
@@ -188,6 +204,20 @@ class AttendanceExceptionAudit(Base):
     actor_email = Column(String(255), nullable=True)
     metadata_json = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ExceptionPolicy(Base):
+    __tablename__ = "exception_policies"
+
+    id = Column(Integer, primary_key=True, default=1)
+    default_deadline_hours = Column(Integer, nullable=False, default=72)
+    auto_closed_deadline_hours = Column(Integer, nullable=True)
+    missed_checkout_deadline_hours = Column(Integer, nullable=True)
+    location_risk_deadline_hours = Column(Integer, nullable=True)
+    large_time_deviation_deadline_hours = Column(Integer, nullable=True)
+    grace_period_days = Column(Integer, nullable=False, default=30)
+    updated_at = Column(DateTime(timezone=True), nullable=True)
+    updated_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
 
 class AttendanceExceptionNotification(Base):

@@ -68,7 +68,17 @@ def _get_employee_for_user(db: Session, user: User) -> Employee:
     if not emp:
         raise HTTPException(
             status_code=400,
-            detail="User chưa được gán Employee. Hãy tạo employee và set employees.user_id = user.id",
+            detail="User chưa được gán Employee. Hãy tạo employee và set employees.user_id = user.id",
+        )
+    if emp.deleted_at is not None:
+        raise HTTPException(
+            status_code=403,
+            detail="Nhân viên đã nghỉ việc, không thể thực hiện chấm công",
+        )
+    if not emp.active:
+        raise HTTPException(
+            status_code=403,
+            detail="Tài khoản nhân viên đang bị vô hiệu hoá, vui lòng liên hệ quản trị viên",
         )
     return emp
 
@@ -824,6 +834,30 @@ def my_attendance_status(db: Session = Depends(get_db), user: User = Depends(get
             can_checkin=False,
             can_checkout=False,
             message="Tai khoan chua duoc gan employee",
+        )
+
+
+    if emp.deleted_at is not None:
+        return AttendanceStatusResponse(
+            employee_assigned=True,
+            employee_id=emp.id,
+            current_state="INACTIVE",
+            last_action=None,
+            last_action_time=None,
+            can_checkin=False,
+            can_checkout=False,
+            message="Nhan vien da nghi viec",
+        )
+    if not emp.active:
+        return AttendanceStatusResponse(
+            employee_assigned=True,
+            employee_id=emp.id,
+            current_state="INACTIVE",
+            last_action=None,
+            last_action_time=None,
+            can_checkin=False,
+            can_checkout=False,
+            message="Tai khoan nhan vien dang bi vo hieu hoa",
         )
 
     now_utc = datetime.now(timezone.utc)

@@ -262,15 +262,58 @@ class MinimumFlowsTestCase(unittest.TestCase):
         email = "flow_user@example.com"
         password = "user123"
 
-        register_res = self.client.post("/auth/register", json={"email": email, "password": password})
+        register_res = self.client.post(
+            "/auth/register",
+            json={
+                "email": email,
+                "password": password,
+                "full_name": "Flow User",
+                "phone": "0901234567",
+            },
+        )
         self.assertEqual(register_res.status_code, 201, register_res.text)
-        self.assertEqual(register_res.json()["role"], "USER")
+        register_body = register_res.json()
+        self.assertEqual(register_body["role"], "USER")
+        self.assertEqual(register_body["full_name"], "Flow User")
+        self.assertEqual(register_body["phone"], "0901234567")
+        self.assertNotIn("employee_code", register_body)
 
         token = self._login(email, password)
+
+        employee_res = self.client.get("/employees/me", headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(employee_res.status_code, 404, employee_res.text)
+
+        self._create_user(email="admin_register_flow@example.com", password="admin123", role="ADMIN")
+        admin_token = self._login("admin_register_flow@example.com", "admin123")
+        users_res = self.client.get("/users", headers={"Authorization": f"Bearer {admin_token}"})
+        self.assertEqual(users_res.status_code, 200, users_res.text)
+        registered_user = next(u for u in users_res.json() if u["email"] == email)
+        self.assertEqual(registered_user["full_name"], "Flow User")
+        self.assertEqual(registered_user["phone"], "0901234567")
+
+        create_employee_res = self.client.post(
+            "/employees",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            json={
+                "code": "NVFLOW",
+                "full_name": registered_user["full_name"],
+                "phone": registered_user["phone"],
+                "user_id": register_body["id"],
+            },
+        )
+        self.assertEqual(create_employee_res.status_code, 200, create_employee_res.text)
+
+        employee_res = self.client.get("/employees/me", headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(employee_res.status_code, 200, employee_res.text)
+        employee_body = employee_res.json()
+        self.assertEqual(employee_body["full_name"], "Flow User")
+        self.assertEqual(employee_body["phone"], "0901234567")
 
         me_res = self.client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
         self.assertEqual(me_res.status_code, 200, me_res.text)
         self.assertEqual(me_res.json()["email"], email)
+        self.assertEqual(me_res.json()["full_name"], "Flow User")
+        self.assertEqual(me_res.json()["phone"], "0901234567")
 
     def test_refresh_token_flow(self) -> None:
         email = "refresh_user@example.com"
