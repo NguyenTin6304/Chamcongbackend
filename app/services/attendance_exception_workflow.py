@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+    from app.models import AttendanceException, ExceptionPolicy
 
 
 AttendanceExceptionWorkflowStatus = str
@@ -123,3 +129,58 @@ def build_exception_status_filter_values(statuses: Iterable[str]) -> list[str]:
         if normalized not in normalized_values:
             normalized_values.append(normalized)
     return normalized_values
+
+
+# ---------------------------------------------------------------------------
+# Deadline helpers
+# ---------------------------------------------------------------------------
+
+def get_deadline_hours(policy: "ExceptionPolicy", exception_type: str) -> int:
+    """Return the configured deadline in hours for the given exception type.
+
+    Falls back to policy.default_deadline_hours when no per-type override is set.
+    """
+    normalized = exception_type.strip().upper()
+    per_type: int | None = None
+    if normalized == "AUTO_CLOSED":
+        per_type = policy.auto_closed_deadline_hours
+    elif normalized == "MISSED_CHECKOUT":
+        per_type = policy.missed_checkout_deadline_hours
+    elif normalized == "LOCATION_RISK":
+        per_type = policy.location_risk_deadline_hours
+    elif normalized == "LARGE_TIME_DEVIATION":
+        per_type = policy.large_time_deviation_deadline_hours
+    return per_type if per_type is not None else policy.default_deadline_hours
+
+
+def get_effective_deadline(exception: "AttendanceException") -> datetime | None:
+    """Return the effective deadline for an exception.
+
+    Uses extended_deadline_at if set (admin override), otherwise expires_at.
+    """
+    return exception.extended_deadline_at or exception.expires_at
+
+
+def auto_expire_overdue(db: "Session", exceptions: list["AttendanceException"]) -> list["AttendanceException"]:
+    """Lazily expire any PENDING_EMPLOYEE exceptions whose effective deadline has passed.
+
+    Mutates status in DB and returns the same list (with updated statuses).
+    """
+    now = datetime.now(timezone.utc)
+    dirty = False
+    for exc in exceptions:
+        if exc.status != PENDING_EMPLOYEE:
+            continue
+        effective = get_effective_deadline(exc)
+        if effective is None:
+            continue
+        # Normalise to UTC-aware for comparison
+        if effective.tzinfo is None:
+            from datetime import timezone as _tz
+            effective = effective.replace(tzinfo=_tz.utc)
+        if now > effective:
+            exc.status = EXPIRED
+            dirty = True
+    if dirty:
+        db.flush()
+    return exceptions

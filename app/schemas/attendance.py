@@ -127,6 +127,7 @@ class AttendanceExceptionReportResponse(BaseModel):
     source_checkin_time: datetime | None = None
     detected_at: datetime | None = None
     expires_at: datetime | None = None
+    extended_deadline_at: datetime | None = None
     employee_explanation: str | None = None
     employee_submitted_at: datetime | None = None
     admin_note: str | None = None
@@ -189,3 +190,7 @@ class AttendanceExceptionApproveRequest(BaseModel):
 
 class AttendanceExceptionRejectRequest(BaseModel):
     admin_note: str = Field(min_length=1, max_length=2000)
+
+
+class AttendanceExceptionExtendDeadlineRequest(BaseModel):
+    extend_hours: int = Field(ge=1, le=168)  # 1 hour to 1 week per extension
