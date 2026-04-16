@@ -48,7 +48,6 @@ from app.services.attendance_exception_notifications import (
 )
 from app.services.attendance_time import (
     DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
-    VN_TZ as _ATT_VN_TZ,
     classify_checkout_status,
     normalize_utc,
     split_regular_overtime_minutes,
@@ -571,7 +570,12 @@ def _queue_employee_exception_notification(
         dedupe_key=f"exception:{exception.id}:{event_type}:employee:{employee_user.id}",
     )
     if notification is not None:
-        background_tasks.add_task(send_exception_notification_background, payload, notification.id)
+        background_tasks.add_task(
+            send_exception_notification_background,
+            payload,
+            notification.id,
+            employee_user.fcm_token,
+        )
 
 
 def _queue_admin_exception_notifications(
@@ -609,7 +613,12 @@ def _queue_admin_exception_notifications(
             dedupe_key=f"exception:{exception.id}:{event_type}:admin:{admin.id}",
         )
         if notification is not None:
-            background_tasks.add_task(send_exception_notification_background, payload, notification.id)
+            background_tasks.add_task(
+                send_exception_notification_background,
+                payload,
+                notification.id,
+                admin.fcm_token,
+            )
 
 
 def _normalize_action_note(value: str | None) -> str | None:

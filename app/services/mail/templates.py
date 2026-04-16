@@ -63,7 +63,7 @@ def build_reset_password_html(payload: ResetPasswordMail) -> str:
         "<p>Bạn vừa yêu cầu đặt lại mật khẩu cho tài khoản Chấm Công.</p>"
         f"<p>Link đặt lại mật khẩu (hiệu lực <b>{payload.expires_minutes} phút</b>):<br>"
         f'<a href="{reset_url}">{reset_url}</a></p>'
-        "<p>Nếu link không mở được, hãy copy token bên dưới và dán thủ công vào màn Đặt lại mật khẩu:</p>"
+        "<p>Nếu link không mở được, hãy copy mã token bên dưới và dán thủ công vào màn Đặt lại mật khẩu:</p>"
         f"<p><code>{reset_token}</code></p>"
         "<p>Nếu bạn không yêu cầu thao tác này, vui lòng bỏ qua email.</p>"
     )

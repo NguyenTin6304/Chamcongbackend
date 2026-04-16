@@ -143,13 +143,39 @@ def _mark_notification_result(notification_id: int, *, error_message: str | None
         db.close()
 
 
+# Keys must match the event_type strings used in app/api/reports.py exactly.
+_PUSH_TITLES: dict[str, str] = {
+    "exception_detected_employee": "Phát hiện ngoại lệ chấm công",
+    "exception_detected_admin": "Phát hiện ngoại lệ chấm công",
+    "exception_submitted_admin": "Nhân viên đã gửi giải trình",
+    "exception_approved_employee": "Ngoại lệ đã được duyệt",
+    "exception_rejected_employee": "Ngoại lệ bị từ chối",
+    "exception_expired_employee": "Ngoại lệ đã hết hạn",
+}
+
+_PUSH_BODIES: dict[str, str] = {
+    "exception_detected_employee": "Hệ thống phát hiện ngoại lệ chấm công. Vui lòng giải trình trong thời hạn quy định.",
+    "exception_detected_admin": "Có ngoại lệ mới cần xử lý. Vui lòng kiểm tra.",
+    "exception_submitted_admin": "Nhân viên vừa gửi giải trình. Vui lòng xem xét và phê duyệt.",
+    "exception_approved_employee": "Ngoại lệ chấm công của bạn đã được phê duyệt.",
+    "exception_rejected_employee": "Ngoại lệ chấm công của bạn bị từ chối. Vui lòng xem chi tiết.",
+    "exception_expired_employee": "Ngoại lệ chấm công đã hết hạn mà chưa được giải trình.",
+}
+
+
 def send_exception_notification_background(
     payload: ExceptionNotificationMail,
     notification_id: int | None = None,
+    fcm_token: str | None = None,
 ) -> None:
+    # ── Email ─────────────────────────────────────────────────────────────────
+    email_failed = False
     try:
         send_exception_notification(payload)
+        if notification_id is not None:
+            _mark_notification_result(notification_id)
     except Exception as exc:
+        email_failed = True
         if notification_id is not None:
             _mark_notification_result(notification_id, error_message=str(exc))
         logger.exception(
@@ -157,6 +183,20 @@ def send_exception_notification_background(
             payload.event_type,
             payload.to_email,
         )
-        return
-    if notification_id is not None:
-        _mark_notification_result(notification_id)
+
+    # ── FCM push — always attempted, independent of email result ─────────────
+    if fcm_token and fcm_token.strip():
+        try:
+            from app.services.fcm_service import send_push_notification
+
+            title = _PUSH_TITLES.get(payload.event_type, "Thông báo chấm công")
+            body = _PUSH_BODIES.get(payload.event_type, "")
+            send_push_notification(fcm_token.strip(), title, body)
+            if email_failed:
+                logger.info(
+                    "FCM push sent despite email failure. event=%s", payload.event_type
+                )
+        except Exception:
+            logger.exception(
+                "FCM push background send failed. event=%s", payload.event_type
+            )

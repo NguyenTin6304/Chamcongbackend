@@ -15,6 +15,7 @@ class User(Base):
     role = Column(String(50), default="USER", nullable=False)
     full_name = Column(String(255), nullable=True)
     phone = Column(String(32), nullable=True)
+    fcm_token = Column(String(512), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
