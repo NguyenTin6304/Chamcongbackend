@@ -208,6 +208,19 @@ def _fetch_daily_report_rows(
     shift_start_expr = func.max(case((AttendanceLog.type == "IN", AttendanceLog.snapshot_start_time), else_=None)).label("shift_start")
     shift_end_expr = func.max(case((AttendanceLog.type == "IN", AttendanceLog.snapshot_end_time), else_=None)).label("shift_end")
 
+    checkin_lat_expr = func.max(
+        case((AttendanceLog.type == "IN", AttendanceLog.lat), else_=None)
+    ).label("checkin_lat")
+    checkin_lng_expr = func.max(
+        case((AttendanceLog.type == "IN", AttendanceLog.lng), else_=None)
+    ).label("checkin_lng")
+    checkout_lat_expr = func.max(
+        case((AttendanceLog.type == "OUT", AttendanceLog.lat), else_=None)
+    ).label("checkout_lat")
+    checkout_lng_expr = func.max(
+        case((AttendanceLog.type == "OUT", AttendanceLog.lng), else_=None)
+    ).label("checkout_lng")
+
     q = (
         db.query(
             work_date_expr.label("work_date"),
@@ -230,6 +243,10 @@ def _fetch_daily_report_rows(
             max_distance_expr,
             shift_start_expr,
             shift_end_expr,
+            checkin_lat_expr,
+            checkin_lng_expr,
+            checkout_lat_expr,
+            checkout_lng_expr,
         )
         .join(Employee, Employee.id == AttendanceLog.employee_id)
         .outerjoin(Group, Group.id == Employee.group_id)
@@ -862,8 +879,10 @@ def list_attendance_logs_for_dashboard(
             "attendance_status": attendance_state,
             "checkin_status": checkin_status,
             "checkout_status": checkout_status_val,
-            "latitude": None,
-            "longitude": None,
+            "checkin_lat": float(row.checkin_lat) if row.checkin_lat is not None else None,
+            "checkin_lng": float(row.checkin_lng) if row.checkin_lng is not None else None,
+            "checkout_lat": float(row.checkout_lat) if row.checkout_lat is not None else None,
+            "checkout_lng": float(row.checkout_lng) if row.checkout_lng is not None else None,
         })
 
     # Sort
