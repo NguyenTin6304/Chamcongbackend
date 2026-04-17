@@ -3,7 +3,7 @@ import hashlib
 import json
 from typing import NamedTuple
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from sqlalchemy import and_, case, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, aliased
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_admin
-from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, User
+from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, ExceptionPolicy, Group, GroupGeofence, User
 from app.schemas.attendance import AttendanceDailyReportResponse, AttendanceLogResponse, AttendanceStatusResponse, CheckActionResponse, LocationRequest
 from app.services.attendance_time import (
     DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
@@ -24,13 +24,21 @@ from app.services.attendance_time import (
 )
 from app.services.geo import haversine_m
 from app.services.attendance_exception_workflow import (
+    PENDING_ADMIN,
+    PENDING_EMPLOYEE,
     can_transition_exception_status,
     default_exception_status_for_type,
     ensure_allowed_exception_transition,
+    get_deadline_hours,
     is_pending_exception_status,
     is_pending_timesheet_exception,
     is_terminal_exception_status,
     normalize_exception_status,
+)
+from app.services.attendance_exception_notifications import (
+    build_exception_notification_mail,
+    create_exception_notification_record,
+    send_exception_notification_background,
 )
 from app.services.location_risk import LocationRiskInput, assess_location_risk
 from app.services.report_consistency import (
@@ -467,6 +475,15 @@ def _ensure_missed_checkout_exception(
     return changed
 
 
+def _default_exception_expires_at(detected_at: datetime, exception_type: str, db: Session) -> datetime | None:
+    """Compute deadline for a new PENDING_EMPLOYEE exception using the configured policy."""
+    hours = 72  # fallback
+    policy = db.query(ExceptionPolicy).filter(ExceptionPolicy.id == 1).first()
+    if policy is not None:
+        hours = get_deadline_hours(policy, exception_type)
+    return detected_at + timedelta(hours=hours)
+
+
 def _ensure_location_risk_exception(
     db: Session,
     emp: Employee,
@@ -476,7 +493,11 @@ def _ensure_location_risk_exception(
     risk_flags: list[str],
     risk_policy_version: str,
     action_type: str,
-) -> None:
+) -> "AttendanceException | None":
+    """Create a SUSPECTED_LOCATION_SPOOF exception for GPS-risk checkin/checkout.
+
+    Returns the newly created AttendanceException, or None if one already existed.
+    """
     existing = (
         db.query(AttendanceException)
         .filter(AttendanceException.source_checkin_log_id == source_checkin_log.id)
@@ -488,22 +509,26 @@ def _ensure_location_risk_exception(
     )
 
     if existing is None:
-        db.add(
-            AttendanceException(
-                employee_id=emp.id,
-                source_checkin_log_id=source_checkin_log.id,
-                exception_type="SUSPECTED_LOCATION_SPOOF",
-                work_date=source_checkin_log.work_date
-                or compute_work_date(
-                    source_checkin_log.time,
-                    source_checkin_log.snapshot_cutoff_minutes or DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
-                ),
-                status=default_exception_status_for_type("SUSPECTED_LOCATION_SPOOF"),
-                note=note,
-                resolved_note=None,
-            )
+        detected_at = datetime.now(timezone.utc)
+        initial_status = default_exception_status_for_type("SUSPECTED_LOCATION_SPOOF")
+        exc = AttendanceException(
+            employee_id=emp.id,
+            source_checkin_log_id=source_checkin_log.id,
+            exception_type="SUSPECTED_LOCATION_SPOOF",
+            work_date=source_checkin_log.work_date
+            or compute_work_date(
+                source_checkin_log.time,
+                source_checkin_log.snapshot_cutoff_minutes or DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
+            ),
+            status=initial_status,
+            detected_at=detected_at,
+            expires_at=_default_exception_expires_at(detected_at, "SUSPECTED_LOCATION_SPOOF", db) if initial_status == PENDING_EMPLOYEE else None,
+            note=note,
+            resolved_note=None,
         )
-        return
+        db.add(exc)
+        db.flush()
+        return exc
 
     if existing.exception_type in {"AUTO_CLOSED", "MISSED_CHECKOUT"}:
         if existing.note:
@@ -511,10 +536,10 @@ def _ensure_location_risk_exception(
                 existing.note = f"{existing.note} | {note}"
         else:
             existing.note = note
-        return
+        return None
 
     if is_terminal_exception_status(existing.status):
-        return
+        return None
 
     existing.exception_type = "SUSPECTED_LOCATION_SPOOF"
     current_status = normalize_exception_status(existing.status)
@@ -526,6 +551,7 @@ def _ensure_location_risk_exception(
     existing.resolved_note = None
     existing.resolved_by = None
     existing.resolved_at = None
+    return None
 
 
 def _ensure_large_time_deviation_exception(
@@ -534,7 +560,11 @@ def _ensure_large_time_deviation_exception(
     source_checkin_log: AttendanceLog,
     deviation_seconds: float,
     action_type: str,
-) -> None:
+) -> "AttendanceException | None":
+    """Create a LARGE_TIME_DEVIATION exception.
+
+    Returns the newly created AttendanceException, or None if one already existed.
+    """
     existing = (
         db.query(AttendanceException)
         .filter(AttendanceException.source_checkin_log_id == source_checkin_log.id)
@@ -547,24 +577,26 @@ def _ensure_large_time_deviation_exception(
     )
 
     if existing is None:
-        db.add(
-            AttendanceException(
-                employee_id=emp.id,
-                source_checkin_log_id=source_checkin_log.id,
-                exception_type="LARGE_TIME_DEVIATION",
-                work_date=source_checkin_log.work_date
-                or compute_work_date(
-                    source_checkin_log.time,
-                    source_checkin_log.snapshot_cutoff_minutes or DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
-                ),
-                status=default_exception_status_for_type("LARGE_TIME_DEVIATION"),
-                note=note,
-            )
+        detected_at = datetime.now(timezone.utc)
+        exc = AttendanceException(
+            employee_id=emp.id,
+            source_checkin_log_id=source_checkin_log.id,
+            exception_type="LARGE_TIME_DEVIATION",
+            work_date=source_checkin_log.work_date
+            or compute_work_date(
+                source_checkin_log.time,
+                source_checkin_log.snapshot_cutoff_minutes or DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
+            ),
+            status=default_exception_status_for_type("LARGE_TIME_DEVIATION"),
+            detected_at=detected_at,
+            note=note,
         )
-        return
+        db.add(exc)
+        db.flush()
+        return exc
 
     if is_terminal_exception_status(existing.status):
-        return
+        return None
 
     # Higher-priority types keep their exception_type; append note only.
     if existing.exception_type in {"AUTO_CLOSED", "MISSED_CHECKOUT", "SUSPECTED_LOCATION_SPOOF"}:
@@ -572,10 +604,137 @@ def _ensure_large_time_deviation_exception(
             existing.note = f"{existing.note} | {note}"
         elif not existing.note:
             existing.note = note
-        return
+        return None
 
     # Existing LARGE_TIME_DEVIATION — refresh note.
     existing.note = note
+    return None
+
+
+def _ensure_out_of_range_exception(
+    db: Session,
+    emp: Employee,
+    source_checkin_log: AttendanceLog,
+    distance_m: float,
+    radius_m: int,
+    action_type: str,
+) -> "AttendanceException | None":
+    """Create a SUSPECTED_LOCATION_SPOOF exception when user checks in/out outside the geofence.
+
+    Only creates a new exception when none already exists for this checkin log.
+    Returns the newly created exception, or None if one already existed.
+    """
+    existing = (
+        db.query(AttendanceException)
+        .filter(AttendanceException.source_checkin_log_id == source_checkin_log.id)
+        .first()
+    )
+    note = (
+        f"Chấm công ngoài phạm vi ({action_type}): "
+        f"khoảng cách {distance_m:.0f}m > bán kính {radius_m}m"
+    )
+
+    if existing is not None:
+        # Append note if not already noted; don't re-notify
+        if not is_terminal_exception_status(existing.status):
+            if existing.note and "ngoài phạm vi" not in existing.note:
+                existing.note = f"{existing.note} | {note}"
+            elif not existing.note:
+                existing.note = note
+        return None
+
+    detected_at = datetime.now(timezone.utc)
+    initial_status = default_exception_status_for_type("SUSPECTED_LOCATION_SPOOF")
+    exc = AttendanceException(
+        employee_id=emp.id,
+        source_checkin_log_id=source_checkin_log.id,
+        exception_type="SUSPECTED_LOCATION_SPOOF",
+        work_date=source_checkin_log.work_date
+        or compute_work_date(
+            source_checkin_log.time,
+            source_checkin_log.snapshot_cutoff_minutes or DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
+        ),
+        status=initial_status,
+        detected_at=detected_at,
+        expires_at=_default_exception_expires_at(detected_at, "SUSPECTED_LOCATION_SPOOF", db) if initial_status == PENDING_EMPLOYEE else None,
+        note=note,
+    )
+    db.add(exc)
+    db.flush()
+    return exc
+
+
+def _notify_new_exception(
+    background_tasks: BackgroundTasks,
+    db: Session,
+    *,
+    exception: AttendanceException,
+    employee: Employee,
+) -> None:
+    """Queue FCM + email notifications for a newly detected exception.
+
+    - PENDING_EMPLOYEE: notifies the employee to explain, and also all admins so they are aware.
+    - PENDING_ADMIN: notifies all admins to decide (employee already submitted or skipped).
+    """
+    # Notify employee when they need to explain
+    if exception.status == PENDING_EMPLOYEE and employee.user_id is not None:
+        emp_user = db.query(User).filter(User.id == employee.user_id).first()
+        if emp_user and emp_user.email:
+            payload = build_exception_notification_mail(
+                event_type="exception_detected_employee",
+                to_email=emp_user.email,
+                exception=exception,
+                employee=employee,
+                recipient_role="EMPLOYEE",
+            )
+            if payload is not None:
+                notif = create_exception_notification_record(
+                    db,
+                    payload=payload,
+                    exception_id=exception.id,
+                    recipient_user_id=emp_user.id,
+                    recipient_role="EMPLOYEE",
+                    dedupe_key=f"exception:{exception.id}:exception_detected_employee:employee:{emp_user.id}",
+                )
+                if notif is not None:
+                    background_tasks.add_task(
+                        send_exception_notification_background,
+                        payload,
+                        notif.id,
+                        emp_user.fcm_token,
+                    )
+
+    # Always notify all admins
+    event_type_admin = "exception_detected_admin"
+    admins = db.query(User).filter(User.role == "ADMIN").all()
+    for admin in admins:
+        if not admin.email:
+            continue
+        payload = build_exception_notification_mail(
+            event_type=event_type_admin,
+            to_email=admin.email,
+            exception=exception,
+            employee=employee,
+            recipient_role="ADMIN",
+            admin_user=admin,
+        )
+        if payload is None:
+            continue
+        notif = create_exception_notification_record(
+            db,
+            payload=payload,
+            exception_id=exception.id,
+            recipient_user_id=admin.id,
+            recipient_role="ADMIN",
+            dedupe_key=f"exception:{exception.id}:{event_type_admin}:admin:{admin.id}",
+        )
+        if notif is not None:
+            background_tasks.add_task(
+                send_exception_notification_background,
+                payload,
+                notif.id,
+                admin.fcm_token,
+            )
 
 
 def _missed_checkout_threshold_utc(open_checkin: AttendanceLog) -> datetime:
@@ -936,6 +1095,7 @@ def my_attendance_status(db: Session = Depends(get_db), user: User = Depends(get
 def checkin(
     payload: LocationRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -1075,8 +1235,11 @@ def checkin(
         db.rollback()
         raise HTTPException(status_code=400, detail="Bạn đã có phiên chấm công cho ngày công này.")
     db.refresh(log)
+
+    new_exception: AttendanceException | None = None
+
     if risk_assessment.decision == "ALLOW_WITH_EXCEPTION":
-        _ensure_location_risk_exception(
+        new_exception = _ensure_location_risk_exception(
             db=db,
             emp=emp,
             source_checkin_log=log,
@@ -1087,11 +1250,22 @@ def checkin(
             action_type="IN",
         )
         db.commit()
+    elif out_of_range:
+        # Plain out-of-range (no GPS spoofing risk detected) — still needs an exception
+        new_exception = _ensure_out_of_range_exception(
+            db=db,
+            emp=emp,
+            source_checkin_log=log,
+            distance_m=nearest_distance,
+            radius_m=nearest_radius,
+            action_type="IN",
+        )
+        db.commit()
 
     if payload.timestamp_client is not None:
         deviation_sec = (checkin_at - payload.timestamp_client).total_seconds()
         if abs(deviation_sec) > settings.LARGE_TIME_DEVIATION_THRESHOLD_MINUTES * 60:
-            _ensure_large_time_deviation_exception(
+            ltd_exc = _ensure_large_time_deviation_exception(
                 db=db,
                 emp=emp,
                 source_checkin_log=log,
@@ -1099,6 +1273,12 @@ def checkin(
                 action_type="IN",
             )
             db.commit()
+            if new_exception is None:
+                new_exception = ltd_exc
+
+    if new_exception is not None:
+        _notify_new_exception(background_tasks, db, exception=new_exception, employee=emp)
+        db.commit()
 
     msg = f"Check-in thành công ({punctuality_status}) cho ngày công {_format_vn_date(work_date)}."
     if out_of_range:
@@ -1132,6 +1312,7 @@ def checkin(
 def checkout(
     payload: LocationRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -1269,8 +1450,11 @@ def checkout(
         db.rollback()
         raise HTTPException(status_code=400, detail="Bạn đã checkout cho ngày công này.")
     db.refresh(log)
+
+    new_exception: AttendanceException | None = None
+
     if risk_assessment.decision == "ALLOW_WITH_EXCEPTION":
-        _ensure_location_risk_exception(
+        new_exception = _ensure_location_risk_exception(
             db=db,
             emp=emp,
             source_checkin_log=open_checkin,
@@ -1281,11 +1465,21 @@ def checkout(
             action_type="OUT",
         )
         db.commit()
+    elif out_of_range:
+        new_exception = _ensure_out_of_range_exception(
+            db=db,
+            emp=emp,
+            source_checkin_log=open_checkin,
+            distance_m=nearest_distance,
+            radius_m=nearest_radius,
+            action_type="OUT",
+        )
+        db.commit()
 
     if payload.timestamp_client is not None:
         deviation_sec = (checkout_at - payload.timestamp_client).total_seconds()
         if abs(deviation_sec) > settings.LARGE_TIME_DEVIATION_THRESHOLD_MINUTES * 60:
-            _ensure_large_time_deviation_exception(
+            ltd_exc = _ensure_large_time_deviation_exception(
                 db=db,
                 emp=emp,
                 source_checkin_log=open_checkin,
@@ -1293,6 +1487,12 @@ def checkout(
                 action_type="OUT",
             )
             db.commit()
+            if new_exception is None:
+                new_exception = ltd_exc
+
+    if new_exception is not None:
+        _notify_new_exception(background_tasks, db, exception=new_exception, employee=emp)
+        db.commit()
 
     msg = f"Check-out thành công ({checkout_status}) cho ngày công {_format_vn_date(work_date)}."
     if out_of_range:
@@ -1538,6 +1738,33 @@ def daily_report_admin(
         )
 
     return response
+
+
+@router.get("/geofences")
+def get_my_geofences(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Return the effective geofence(s) for the current user — used by the home map."""
+    emp = _find_employee_for_user(db, user)
+    if emp is None:
+        return []
+
+    active_rule = db.query(CheckinRule).filter(CheckinRule.active.is_(True)).first()
+    if active_rule is None:
+        return []
+
+    geofences, geofence_source, fallback_reason = _get_effective_geofences(db, emp, active_rule)
+    return [
+        {
+            "name": g.name,
+            "latitude": g.latitude,
+            "longitude": g.longitude,
+            "radius_m": g.radius_m,
+            "source": geofence_source,
+        }
+        for g in geofences
+    ]
 
 
 @router.get("", response_model=list[AttendanceLogResponse])
