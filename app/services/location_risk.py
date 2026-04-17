@@ -149,11 +149,10 @@ def assess_location_risk(payload: LocationRiskInput) -> LocationRiskAssessment:
         score += 20
         flags.append("BAD_ACCURACY")
     if is_mobile_web and not has_network_context:
-        score += 20
+        # Reduced from 20→10: Vercel UAT does not forward IP-geo headers, so this
+        # fires for ALL mobile users on that deployment — not a reliable fraud signal.
+        score += 10
         flags.append("MOBILE_WEB_MISSING_NETWORK_CONTEXT")
-    if is_mobile_web and not has_network_context and accuracy is not None and accuracy <= 10:
-        score += 20
-        flags.append("TOO_PERFECT_GPS_WITHOUT_NETWORK_CONTEXT")
 
     outside_distance_m = max(0.0, float(payload.distance_to_geofence_m) - max(0, int(payload.radius_m)))
     if outside_distance_m > 1000:

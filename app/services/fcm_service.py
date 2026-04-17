@@ -1,13 +1,3 @@
-"""Firebase Cloud Messaging push notification service.
-
-Usage:
-  Place your Firebase service account JSON at the path specified by
-  FCM_SERVICE_ACCOUNT_PATH in .env, then set FCM_ENABLED=true.
-
-  Example .env:
-    FCM_ENABLED=true
-    FCM_SERVICE_ACCOUNT_PATH=/app/chamcongfcm-service-account.json
-"""
 import logging
 
 logger = logging.getLogger(__name__)
