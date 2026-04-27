@@ -116,6 +116,7 @@ class GroupGeofenceCreateRequest(BaseModel):
     longitude: float = Field(ge=-180, le=180)
     radius_m: int = Field(ge=MIN_GEOFENCE_RADIUS_M, le=MAX_GEOFENCE_RADIUS_M)
     active: bool = True
+    location_type: str = Field(default="SITE", pattern="^(VP|SITE)$")
 
 
 class GroupGeofenceUpdateRequest(BaseModel):
@@ -124,6 +125,7 @@ class GroupGeofenceUpdateRequest(BaseModel):
     longitude: float | None = Field(default=None, ge=-180, le=180)
     radius_m: int | None = Field(default=None, ge=MIN_GEOFENCE_RADIUS_M, le=MAX_GEOFENCE_RADIUS_M)
     active: bool | None = None
+    location_type: str | None = Field(default=None, pattern="^(VP|SITE)$")
 
 
 class GroupGeofenceResponse(BaseModel):
@@ -134,6 +136,7 @@ class GroupGeofenceResponse(BaseModel):
     longitude: float
     radius_m: int
     active: bool
+    location_type: str = "SITE"
     radius_policy_warning: str | None = None
 
     class Config:

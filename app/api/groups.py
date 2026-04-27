@@ -33,6 +33,7 @@ def _to_geofence_response(geofence: GroupGeofence) -> GroupGeofenceResponse:
         longitude=geofence.longitude,
         radius_m=geofence.radius_m,
         active=geofence.active,
+        location_type=geofence.location_type,
         radius_policy_warning=_radius_policy_warning(geofence.radius_m),
     )
 
@@ -215,6 +216,7 @@ def create_group_geofence(
         longitude=payload.longitude,
         radius_m=payload.radius_m,
         active=payload.active,
+        location_type=payload.location_type,
     )
 
     db.add(geofence)
@@ -260,6 +262,8 @@ def update_group_geofence(
         geofence.radius_m = payload.radius_m
     if payload.active is not None:
         geofence.active = payload.active
+    if payload.location_type is not None:
+        geofence.location_type = payload.location_type
 
     db.commit()
     db.refresh(geofence)
