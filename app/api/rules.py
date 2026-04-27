@@ -1,13 +1,15 @@
-﻿from datetime import datetime, time, timezone
+﻿from datetime import date, datetime, time, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_admin
 from app.core.policy import WARN_GEOFENCE_RADIUS_M
-from app.models import CheckinRule, ExceptionPolicy, User
+from app.models import CheckinRule, ExceptionPolicy, PublicHoliday, User
 from app.schemas.rules import RuleResponse, RuleUpdateRequest
 from app.schemas.exception_policy import ExceptionPolicyResponse, ExceptionPolicyPatch
 
@@ -205,3 +207,62 @@ def patch_exception_policy(
     db.commit()
     db.refresh(policy)
     return _policy_to_response(policy, db)
+
+
+# ---------------------------------------------------------------------------
+# Public Holidays
+# ---------------------------------------------------------------------------
+
+class PublicHolidayResponse(BaseModel):
+    id: int
+    date: date
+    name: str
+
+    model_config = {"from_attributes": True}
+
+
+class PublicHolidayCreateRequest(BaseModel):
+    date: date
+    name: str
+
+
+@router.get("/public-holidays", response_model=list[PublicHolidayResponse])
+def list_public_holidays(
+    year: Optional[int] = None,
+    db: Session = Depends(get_db),
+    _=Depends(get_current_user),
+):
+    q = db.query(PublicHoliday)
+    if year is not None:
+        from sqlalchemy import extract
+        q = q.filter(extract("year", PublicHoliday.date) == year)
+    return q.order_by(PublicHoliday.date.asc()).all()
+
+
+@router.post("/public-holidays", response_model=PublicHolidayResponse, status_code=201)
+def create_public_holiday(
+    payload: PublicHolidayCreateRequest,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    existing = db.query(PublicHoliday).filter(PublicHoliday.date == payload.date).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Ngày lễ đã tồn tại")
+    holiday = PublicHoliday(date=payload.date, name=payload.name)
+    db.add(holiday)
+    db.commit()
+    db.refresh(holiday)
+    return holiday
+
+
+@router.delete("/public-holidays/{holiday_id}", status_code=204)
+def delete_public_holiday(
+    holiday_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    holiday = db.query(PublicHoliday).filter(PublicHoliday.id == holiday_id).first()
+    if not holiday:
+        raise HTTPException(status_code=404, detail="Không tìm thấy ngày lễ")
+    db.delete(holiday)
+    db.commit()

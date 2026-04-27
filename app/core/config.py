@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     EXCEPTION_WORKFLOW_SYSTEM_KEY: str = ""
     LARGE_TIME_DEVIATION_THRESHOLD_MINUTES: int = 120
 
+    # Firebase Cloud Messaging (push notifications)
+    FCM_ENABLED: bool = False
+    # Absolute path to the Firebase service account JSON file.
+    FCM_SERVICE_ACCOUNT_PATH: str = ""
+
 
 settings = Settings()
 

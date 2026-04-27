@@ -79,3 +79,11 @@ class MessageResponse(BaseModel):
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(min_length=1, max_length=128)
     new_password: str = Field(min_length=6, max_length=128)
+
+
+class FcmTokenRequest(BaseModel):
+    fcm_token: str = Field(max_length=512)
+
+
+class TestExceptionNotificationRequest(BaseModel):
+    event_type: str = "EXCEPTION_DETECTED"

@@ -17,6 +17,10 @@ env/
 .env.*
 !.env.example
 
+# Firebase service account (contains private key — never commit)
+*-service-account.json
+firebase-adminsdk-*.json
+
 # Tool caches
 .pytest_cache/
 .mypy_cache/

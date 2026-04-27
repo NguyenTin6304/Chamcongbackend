@@ -2,7 +2,6 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
-from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -20,6 +19,7 @@ from app.core.security import (
 from app.models import RefreshToken, User
 from app.schemas.auth import (
     ChangePasswordRequest,
+    FcmTokenRequest,
     ForgotPasswordRequest,
     LoginRequest,
     MessageResponse,
@@ -27,6 +27,7 @@ from app.schemas.auth import (
     RegisterRequest,
     RegisterResponse,
     ResetPasswordRequest,
+    TestExceptionNotificationRequest,
     TokenResponse,
     UserMeResponse,
 )
@@ -39,6 +40,15 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
 
 GENERIC_FORGOT_PASSWORD_MESSAGE = "Nếu email tồn tại, hệ thống đã gửi hướng dẫn đặt lại mật khẩu."
+
+_VALID_TEST_EXCEPTION_EVENTS = {
+    "exception_detected_employee",
+    "exception_detected_admin",
+    "exception_submitted_admin",
+    "exception_approved_employee",
+    "exception_rejected_employee",
+    "exception_expired_employee",
+}
 
 
 def _authenticate_user(db: Session, email: str, password: str) -> User:
@@ -180,34 +190,6 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
     return MessageResponse(message="Đặt lại mật khẩu thành công")
 
 
-@router.post("/login-form", response_model=TokenResponse, deprecated=True)
-def login_form(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    # Legacy compatibility endpoint: form-data (username/password).
-    if settings.RECAPTCHA_ENABLED:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "code": "RECAPTCHA_REQUIRED",
-                "message": "reCAPTCHA đang bật. Hãy dùng endpoint /auth/login",
-            },
-        )
-
-    user = _authenticate_user(db, form_data.username, form_data.password)
-    tokens = _issue_tokens(db, user, remember_me=True)
-    db.commit()
-    return tokens
-
-
-@router.post("/login-json", response_model=TokenResponse, deprecated=True)
-def login_json(payload: LoginRequest, request: Request, db: Session = Depends(get_db)):
-    # Deprecated alias of /auth/login for backward compatibility.
-    verify_login_recaptcha(token=payload.recaptcha_token, remote_ip=_get_request_ip(request))
-    user = _authenticate_user(db, payload.email, payload.password)
-    tokens = _issue_tokens(db, user, remember_me=payload.remember_me)
-    db.commit()
-    return tokens
-
-
 @router.post("/refresh", response_model=TokenResponse)
 def refresh(payload: RefreshTokenRequest, db: Session = Depends(get_db)):
     try:
@@ -340,3 +322,73 @@ def change_password(
     current_user.password_hash = hash_password(payload.new_password)
     db.commit()
     return MessageResponse(message="Đổi mật khẩu thành công")
+
+
+@router.post("/fcm-token", response_model=MessageResponse)
+def update_fcm_token(
+    payload: FcmTokenRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Register or update the FCM device token for the current user."""
+    token = payload.fcm_token.strip()
+    current_user.fcm_token = token if token else None
+    db.commit()
+    return MessageResponse(message="FCM token đã cập nhật")
+
+
+@router.post("/test-notification", response_model=MessageResponse)
+def test_notification(
+    current_user: User = Depends(get_current_user),
+):
+    """Send a test push notification to the current user's device (dev/debug use)."""
+    token = current_user.fcm_token
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Không có FCM token. Vui lòng đăng nhập lại để đăng ký thiết bị.",
+        )
+    from app.services.fcm_service import send_push_notification
+
+    ok = send_push_notification(
+        token,
+        title="Thông báo thử nghiệm",
+        body="Hệ thống push notification đang hoạt động bình thường.",
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Gửi push thất bại. Kiểm tra FCM_ENABLED và service account.",
+        )
+    return MessageResponse(message="Đã gửi thông báo thử nghiệm")
+
+
+@router.post("/test-exception-notification", response_model=MessageResponse)
+def test_exception_notification(
+    payload: TestExceptionNotificationRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Send a test exception push notification of a specific event type (dev/debug use)."""
+    if payload.event_type not in _VALID_TEST_EXCEPTION_EVENTS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"event_type không hợp lệ. Phải là một trong: {', '.join(sorted(_VALID_TEST_EXCEPTION_EVENTS))}",
+        )
+    token = current_user.fcm_token
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Không có FCM token. Vui lòng đăng nhập lại để đăng ký thiết bị.",
+        )
+    from app.services.attendance_exception_notifications import _PUSH_BODIES, _PUSH_TITLES
+    from app.services.fcm_service import send_push_notification
+
+    title = _PUSH_TITLES.get(payload.event_type, "Thông báo chấm công")
+    body = _PUSH_BODIES.get(payload.event_type, "")
+    ok = send_push_notification(token, title, body)
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Gửi push thất bại. Kiểm tra FCM_ENABLED và service account.",
+        )
+    return MessageResponse(message=f"Đã gửi: {payload.event_type}")

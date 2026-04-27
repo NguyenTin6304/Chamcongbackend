@@ -5,14 +5,14 @@ import json
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from sqlalchemy import and_, case, func, or_
 from sqlalchemy.orm import Session, aliased
 
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_admin, require_exception_workflow_system
-from app.models import AttendanceException, AttendanceExceptionAudit, AttendanceExceptionNotification, AttendanceLog, CheckinRule, Employee, ExceptionPolicy, Group, GroupGeofence, User
+from app.models import AttendanceException, AttendanceExceptionAudit, AttendanceExceptionNotification, AttendanceLog, CheckinRule, Employee, ExceptionPolicy, Group, GroupGeofence, LeaveRequest, PublicHoliday, User
 from app.schemas.attendance import (
     AttendanceExceptionApproveRequest,
     AttendanceExceptionAuditResponse,
@@ -48,7 +48,6 @@ from app.services.attendance_exception_notifications import (
 )
 from app.services.attendance_time import (
     DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
-    VN_TZ as _ATT_VN_TZ,
     classify_checkout_status,
     normalize_utc,
     split_regular_overtime_minutes,
@@ -209,6 +208,19 @@ def _fetch_daily_report_rows(
     shift_start_expr = func.max(case((AttendanceLog.type == "IN", AttendanceLog.snapshot_start_time), else_=None)).label("shift_start")
     shift_end_expr = func.max(case((AttendanceLog.type == "IN", AttendanceLog.snapshot_end_time), else_=None)).label("shift_end")
 
+    checkin_lat_expr = func.max(
+        case((AttendanceLog.type == "IN", AttendanceLog.lat), else_=None)
+    ).label("checkin_lat")
+    checkin_lng_expr = func.max(
+        case((AttendanceLog.type == "IN", AttendanceLog.lng), else_=None)
+    ).label("checkin_lng")
+    checkout_lat_expr = func.max(
+        case((AttendanceLog.type == "OUT", AttendanceLog.lat), else_=None)
+    ).label("checkout_lat")
+    checkout_lng_expr = func.max(
+        case((AttendanceLog.type == "OUT", AttendanceLog.lng), else_=None)
+    ).label("checkout_lng")
+
     q = (
         db.query(
             work_date_expr.label("work_date"),
@@ -231,6 +243,10 @@ def _fetch_daily_report_rows(
             max_distance_expr,
             shift_start_expr,
             shift_end_expr,
+            checkin_lat_expr,
+            checkin_lng_expr,
+            checkout_lat_expr,
+            checkout_lng_expr,
         )
         .join(Employee, Employee.id == AttendanceLog.employee_id)
         .outerjoin(Group, Group.id == Employee.group_id)
@@ -571,7 +587,12 @@ def _queue_employee_exception_notification(
         dedupe_key=f"exception:{exception.id}:{event_type}:employee:{employee_user.id}",
     )
     if notification is not None:
-        background_tasks.add_task(send_exception_notification_background, payload, notification.id)
+        background_tasks.add_task(
+            send_exception_notification_background,
+            payload,
+            notification.id,
+            employee_user.fcm_token,
+        )
 
 
 def _queue_admin_exception_notifications(
@@ -609,7 +630,12 @@ def _queue_admin_exception_notifications(
             dedupe_key=f"exception:{exception.id}:{event_type}:admin:{admin.id}",
         )
         if notification is not None:
-            background_tasks.add_task(send_exception_notification_background, payload, notification.id)
+            background_tasks.add_task(
+                send_exception_notification_background,
+                payload,
+                notification.id,
+                admin.fcm_token,
+            )
 
 
 def _normalize_action_note(value: str | None) -> str | None:
@@ -853,8 +879,10 @@ def list_attendance_logs_for_dashboard(
             "attendance_status": attendance_state,
             "checkin_status": checkin_status,
             "checkout_status": checkout_status_val,
-            "latitude": None,
-            "longitude": None,
+            "checkin_lat": float(row.checkin_lat) if row.checkin_lat is not None else None,
+            "checkin_lng": float(row.checkin_lng) if row.checkin_lng is not None else None,
+            "checkout_lat": float(row.checkout_lat) if row.checkout_lat is not None else None,
+            "checkout_lng": float(row.checkout_lng) if row.checkout_lng is not None else None,
         })
 
     # Sort
@@ -2006,3 +2034,508 @@ def purge_expired_attendance_exceptions(
         "expired_count": expired_count,
         "grace_period_days": grace_period_days,
     }
+
+
+# ---------------------------------------------------------------------------
+# Monthly Attendance Matrix — Phase 1: data / logic helpers
+# ---------------------------------------------------------------------------
+
+def _geofence_type(name: str | None, location_type: str | None = None) -> str:
+    """Classify a geofence into VP / SITE / SYSTEM_RULE.
+
+    Prefer explicit location_type from DB; fall back to keyword-matching on name
+    for legacy records created before the location_type column existed.
+    """
+    if location_type in ("VP", "SITE"):
+        return location_type
+    if not name:
+        return "SYSTEM_RULE"
+    # legacy fallback: guess from name keywords
+    n = name.lower()
+    if any(k in n for k in ["vp", "văn phòng", "van phong", "office", "hq"]):
+        return "VP"
+    return "SITE"
+
+
+_FULL_CODES = {"V", "S", "X"}
+_HALF_CODES = {"1/2V", "1/2S", "1/2T"}
+
+
+def _build_leave_map(
+    db: Session,
+    from_date: date,
+    to_date: date,
+    group_id: int | None = None,
+) -> dict[tuple[int, date], str]:
+    """Return {(employee_id, day): code} for all APPROVED leave requests that
+    overlap [from_date, to_date].
+
+    code is 'P' for PAID and 'K' for UNPAID (treated same as absent but
+    annotated so the caller can distinguish if needed).
+    """
+    q = (
+        db.query(LeaveRequest.employee_id, LeaveRequest.start_date, LeaveRequest.end_date, LeaveRequest.leave_type)
+        .filter(
+            LeaveRequest.status == "APPROVED",
+            LeaveRequest.start_date <= to_date,
+            LeaveRequest.end_date >= from_date,
+        )
+    )
+    if group_id is not None:
+        q = q.join(Employee, Employee.id == LeaveRequest.employee_id).filter(
+            Employee.group_id == group_id
+        )
+
+    leave_map: dict[tuple[int, date], str] = {}
+    for eid, start, end, ltype in q.all():
+        code = "P" if ltype == "PAID" else "K"
+        cur = max(start, from_date)
+        while cur <= min(end, to_date):
+            leave_map[(int(eid), cur)] = code
+            cur += timedelta(days=1)
+    return leave_map
+
+
+def _derive_cell_code(row, exception_map: dict, holiday_set: set, geofence_location_map: dict | None = None) -> str:
+    """
+    Derive the attendance cell symbol for one (employee, work_date) pair.
+    Only called when row is not None (has checkin).
+
+    Priority (highest → lowest):
+    1. Public holiday + has checkin → V / S / X (treat as normal worked day)
+    2. MISSED_CHECKOUT exception → 1/2T
+    3. Checkin LATE → 1/2T
+    4-8. Full / half day by geofence type
+    """
+    if row is None:
+        # Kept for safety — callers should resolve K/L/P before calling this.
+        return "L" if holiday_set else "K"
+
+    # row exists → has checkin
+    exc_status, exc_type = exception_map.get((row.employee_id, row.work_date), (None, None))
+    if exc_type == "MISSED_CHECKOUT":
+        return "1/2T"
+
+    punctuality = _rank_to_punctuality(row.punctuality_rank)
+    if punctuality == "LATE":
+        return "1/2T"
+
+    geo_name = row.checkin_matched_geofence or row.checkout_matched_geofence
+    geo_location_type = (
+        (geofence_location_map or {}).get((row.group_id, geo_name))
+        if geo_name else None
+    )
+    geo_type = _geofence_type(geo_name, geo_location_type)
+    shift_start = row.shift_start or time(8, 0)
+    shift_end = row.shift_end or time(17, 0)
+    regular_minutes, _, _ = split_regular_overtime_minutes(
+        row.work_date,
+        row.checkin_time,
+        row.checkout_time,
+        shift_start,
+        shift_end,
+    )
+    full_day = (regular_minutes or 0) >= 480
+
+    if geo_type == "VP":
+        return "V" if full_day else "1/2V"
+    if geo_type == "SITE":
+        return "S" if full_day else "1/2S"
+    # SYSTEM_RULE
+    return "X" if full_day else "1/2T"
+
+
+def _calc_summary(codes: list[str]) -> dict:
+    """Compute aggregate columns from a list of cell codes for one employee."""
+    return {
+        "ngay_cong": sum(
+            1.0 if c in _FULL_CODES else 0.5 if c in _HALF_CODES else 0.0
+            for c in codes
+        ),
+        "tai_vp": sum(1.0 if c == "V" else 0.5 if c == "1/2V" else 0.0 for c in codes),
+        "tai_site": sum(1.0 if c == "S" else 0.5 if c == "1/2S" else 0.0 for c in codes),
+        "vang_k": codes.count("K"),
+        "nghi_le": codes.count("L"),
+        "nghi_p": codes.count("P"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Monthly Attendance Matrix — Phase 1: endpoint + data pivot
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Monthly Attendance Matrix — Phase 2: Excel builder
+# ---------------------------------------------------------------------------
+
+_VN_WEEKDAY = {0: "T2", 1: "T3", 2: "T4", 3: "T5", 4: "T6", 5: "T7", 6: "CN"}
+
+_CODE_FILLS = {
+    "V":    PatternFill(start_color="DBEAFE", end_color="DBEAFE", fill_type="solid"),
+    "S":    PatternFill(start_color="FEF9C3", end_color="FEF9C3", fill_type="solid"),
+    "X":    None,
+    "1/2V": PatternFill(start_color="FED7AA", end_color="FED7AA", fill_type="solid"),
+    "1/2S": PatternFill(start_color="FED7AA", end_color="FED7AA", fill_type="solid"),
+    "1/2T": PatternFill(start_color="FED7AA", end_color="FED7AA", fill_type="solid"),
+    "K":    PatternFill(start_color="FECACA", end_color="FECACA", fill_type="solid"),
+    "L":    PatternFill(start_color="E9D5FF", end_color="E9D5FF", fill_type="solid"),
+    "P":    PatternFill(start_color="D1FAE5", end_color="D1FAE5", fill_type="solid"),
+}
+_SAT_FILL     = PatternFill(start_color="F3F4F6", end_color="F3F4F6", fill_type="solid")
+_SUN_FILL     = PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid")
+_HOL_FILL     = PatternFill(start_color="EDE9FE", end_color="EDE9FE", fill_type="solid")
+_HDR_FILL     = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
+_SUBHDR_FILL  = PatternFill(start_color="DBEAFE", end_color="DBEAFE", fill_type="solid")
+_SUM_FILL     = PatternFill(start_color="ECFDF5", end_color="ECFDF5", fill_type="solid")
+
+_SUMMARY_HEADERS = ["Ngày công", "Tại VP", "Tại Site", "Nghỉ lễ (L)", "Nghỉ lương (P)", "Vắng (K)"]
+_SUMMARY_KEYS    = ["ngay_cong", "tai_vp", "tai_site", "nghi_le", "nghi_p", "vang_k"]
+_SUMMARY_WIDTHS  = [10, 9, 9, 11, 13, 9]
+
+_LEGEND_ITEMS = [
+    ("V",    "Đủ công ≥ 8h tại Văn phòng"),
+    ("S",    "Đủ công ≥ 8h tại Site"),
+    ("X",    "Đủ công ≥ 8h (không có geofence)"),
+    ("1/2V", "Làm < 8h tại Văn phòng"),
+    ("1/2S", "Làm < 8h tại Site"),
+    ("1/2T", "Đi trễ hoặc quên chấm công"),
+    ("K",    "Vắng không lương"),
+    ("L",    "Nghỉ lễ"),
+    ("P",    "Nghỉ có lương (chờ module nghỉ phép)"),
+]
+
+_CENTER  = Alignment(horizontal="center", vertical="center")
+_LEFT    = Alignment(horizontal="left",   vertical="center")
+_WRAP    = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+
+def _day_col_fill(weekday: int, is_holiday: bool) -> PatternFill | None:
+    if is_holiday:
+        return _HOL_FILL
+    if weekday == 6:
+        return _SUN_FILL
+    if weekday == 5:
+        return _SAT_FILL
+    return _SUBHDR_FILL
+
+
+def _build_monthly_excel(
+    *,
+    year: int,
+    month: int,
+    group_id: int | None,
+    all_employees: list,
+    emp_meta: dict[int, tuple[str, str]],
+    days: list[int],
+    matrix: dict[int, list[str]],
+    summaries: dict[int, dict],
+    holiday_set: set,
+) -> StreamingResponse:
+    last_day = days[-1]
+
+    # Column layout: A=1 STT | B=2 MãNV | C=3 Tên | D..=day cols | then summary cols
+    DATA_COL = 4
+    SUM_COL  = DATA_COL + last_day
+    TOT_COLS = SUM_COL + len(_SUMMARY_HEADERS) - 1
+
+    # Per-day metadata
+    day_wd  = [date(year, month, d).weekday() for d in days]   # 0=Mon … 6=Sun
+    day_hol = [date(year, month, d) in holiday_set for d in days]
+
+    # --- Employee order: active sorted by code, then extras with logs ---
+    active_ids = {emp.id for emp in all_employees}
+    emp_order  = [emp.id for emp in all_employees if emp.id in matrix]
+    for eid in matrix:
+        if eid not in active_ids:
+            emp_order.append(eid)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"T{month:02d}-{year}"
+
+    # ── Row 1: Title ──────────────────────────────────────────────────────────
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=TOT_COLS)
+    c = ws.cell(1, 1)
+    c.value     = f"BẢNG CHẤM CÔNG THÁNG {month:02d}/{year}"
+    c.font      = Font(bold=True, size=14, color="1E3A8A")
+    c.alignment = _CENTER
+    ws.row_dimensions[1].height = 28
+
+    # ── Row 2: Column headers ─────────────────────────────────────────────────
+    for col, label in ((1, "STT"), (2, "Mã NV"), (3, "Họ và Tên")):
+        c = ws.cell(2, col)
+        c.value     = label
+        c.fill      = _HDR_FILL
+        c.font      = Font(bold=True, size=10, color="FFFFFF")
+        c.alignment = _CENTER
+
+    for i, d in enumerate(days):
+        col = DATA_COL + i
+        c = ws.cell(2, col)
+        c.value     = f"{d:02d}"
+        c.fill      = _day_col_fill(day_wd[i], day_hol[i])
+        c.font      = Font(bold=True, size=10,
+                           color="7C3AED" if day_hol[i] else
+                                 "D97706" if day_wd[i] == 6 else
+                                 "6B7280" if day_wd[i] == 5 else "1E3A8A")
+        c.alignment = _CENTER
+
+    for i, hdr in enumerate(_SUMMARY_HEADERS):
+        c = ws.cell(2, SUM_COL + i)
+        c.value     = hdr
+        c.fill      = _SUM_FILL
+        c.font      = Font(bold=True, size=10, color="065F46")
+        c.alignment = _WRAP
+    ws.row_dimensions[2].height = 22
+
+    # ── Row 3: Weekday names ──────────────────────────────────────────────────
+    for col in (1, 2, 3):
+        c = ws.cell(3, col)
+        c.fill = _HDR_FILL
+        c.font = Font(bold=True, size=9, color="FFFFFF")
+
+    for i, d in enumerate(days):
+        col = DATA_COL + i
+        c = ws.cell(3, col)
+        c.value     = _VN_WEEKDAY[day_wd[i]]
+        c.fill      = _day_col_fill(day_wd[i], day_hol[i])
+        c.font      = Font(size=9,
+                           color="7C3AED" if day_hol[i] else
+                                 "D97706" if day_wd[i] == 6 else
+                                 "6B7280" if day_wd[i] == 5 else "1E3A8A")
+        c.alignment = _CENTER
+
+    for i in range(len(_SUMMARY_HEADERS)):
+        ws.cell(3, SUM_COL + i).fill = _SUM_FILL
+    ws.row_dimensions[3].height = 15
+
+    # ── Data rows ─────────────────────────────────────────────────────────────
+    for seq, eid in enumerate(emp_order, start=1):
+        r        = 3 + seq  # row 4, 5, …
+        emp_code, full_name = emp_meta.get(eid, ("", ""))
+        codes    = matrix[eid]
+        summary  = summaries[eid]
+
+        ws.cell(r, 1).value     = seq
+        ws.cell(r, 1).alignment = _CENTER
+        ws.cell(r, 2).value     = emp_code
+        ws.cell(r, 2).alignment = _CENTER
+        ws.cell(r, 3).value     = full_name
+        ws.cell(r, 3).alignment = _LEFT
+
+        for i, code in enumerate(codes):
+            col  = DATA_COL + i
+            cell = ws.cell(r, col)
+            cell.alignment = _CENTER
+
+            # Background: code fill > weekend col fill
+            col_fill = _day_col_fill(day_wd[i], day_hol[i])
+            code_fill = _CODE_FILLS.get(code) if code else None
+            if code_fill is not None:
+                cell.fill = code_fill
+            elif not code and col_fill is not None:
+                cell.fill = col_fill
+            elif col_fill is not None and code in ("", None):
+                cell.fill = col_fill
+
+            if not code:
+                continue  # weekend blank — no value
+
+            cell.value = code
+            if code == "K":
+                cell.font = Font(bold=True, size=10, color="DC2626")
+            elif code == "L":
+                cell.font = Font(bold=True, size=10, color="7C3AED")
+            elif code in _FULL_CODES:
+                cell.font = Font(bold=True, size=10, color="1D4ED8")
+            else:
+                cell.font = Font(size=10, color="92400E")
+
+        for i, key in enumerate(_SUMMARY_KEYS):
+            col  = SUM_COL + i
+            cell = ws.cell(r, col)
+            val  = summary.get(key, 0)
+            # Display as int if whole number, else float with 1 decimal
+            cell.value     = int(val) if val == int(val) else round(val, 1)
+            cell.alignment = _CENTER
+            cell.fill      = _SUM_FILL
+            cell.font      = (Font(bold=True, size=10, color="065F46") if val > 0
+                               else Font(size=10, color="9CA3AF"))
+
+        ws.row_dimensions[r].height = 18
+
+    # ── Legend ────────────────────────────────────────────────────────────────
+    legend_row = 3 + len(emp_order) + 2
+    ws.cell(legend_row, 1).value = "CHÚ THÍCH:"
+    ws.cell(legend_row, 1).font  = Font(bold=True, size=10)
+
+    for i, (code, desc) in enumerate(_LEGEND_ITEMS):
+        r    = legend_row + 1 + i
+        cc   = ws.cell(r, 1)
+        cc.value     = code
+        cc.alignment = _CENTER
+        cc.font      = Font(bold=True, size=10)
+        fill = _CODE_FILLS.get(code)
+        if fill:
+            cc.fill = fill
+
+        dc = ws.cell(r, 2)
+        dc.value = desc
+        dc.font  = Font(size=10)
+        dc.alignment = _LEFT
+
+    # ── Column widths ─────────────────────────────────────────────────────────
+    ws.column_dimensions["A"].width = 5
+    ws.column_dimensions["B"].width = 10
+    ws.column_dimensions["C"].width = 24
+    for i in range(last_day):
+        ws.column_dimensions[get_column_letter(DATA_COL + i)].width = 4.5
+    for i, w in enumerate(_SUMMARY_WIDTHS):
+        ws.column_dimensions[get_column_letter(SUM_COL + i)].width = w
+
+    # ── Freeze: rows 1-3 + cols A-C ──────────────────────────────────────────
+    ws.freeze_panes = "D4"
+
+    # ── Stream ────────────────────────────────────────────────────────────────
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    group_suffix = f"_nhom_{group_id}" if group_id is not None else ""
+    filename = f"cham_cong_thang_{month:02d}_{year}{group_suffix}.xlsx"
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/attendance-monthly.xlsx")
+def export_monthly_attendance_excel(
+    month: int = Query(..., ge=1, le=12),
+    year: int = Query(..., ge=2020, le=2100),
+    group_id: int | None = None,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """Export monthly attendance matrix as Excel.
+
+    Returns a spreadsheet with one row per employee and one column per calendar
+    day, filled with attendance codes (V/S/X/1/2V/1/2S/1/2T/K/L/P).
+    Summary columns (ngày công, tại VP, tại Site, nghỉ lễ, nghỉ P, vắng K) are
+    appended at the right.
+    """
+    import calendar
+
+    from_date = date(year, month, 1)
+    last_day = calendar.monthrange(year, month)[1]
+    to_date = date(year, month, last_day)
+
+    if group_id is not None:
+        group = db.query(Group).filter(Group.id == group_id).first()
+        if not group:
+            raise HTTPException(status_code=404, detail="group_id không tồn tại")
+
+    # --- Load attendance rows (employees who have checkin records) ---
+    rows = _fetch_daily_report_rows(db, from_date, to_date, None, group_id)
+    exception_map = _build_exception_map(db, from_date, to_date, None, group_id)
+
+    # --- Load public holidays for the month ---
+    from sqlalchemy import extract as sa_extract
+    holiday_rows = (
+        db.query(PublicHoliday.date)
+        .filter(
+            sa_extract("year", PublicHoliday.date) == year,
+            sa_extract("month", PublicHoliday.date) == month,
+        )
+        .all()
+    )
+    holiday_set: set[date] = {r.date for r in holiday_rows}
+
+    # --- Build (group_id, name) → location_type lookup ---
+    # Keyed by (group_id, name) to avoid collision when two groups share a geofence name
+    # but have different location_type values.
+    gf_q = db.query(GroupGeofence.group_id, GroupGeofence.name, GroupGeofence.location_type)
+    if group_id is not None:
+        gf_q = gf_q.filter(GroupGeofence.group_id == group_id)
+    geofence_location_map: dict[tuple[int, str], str] = {
+        (gid, gname): lt for gid, gname, lt in gf_q.all()
+    }
+
+    # --- Load approved leave requests overlapping this month ---
+    leave_map = _build_leave_map(db, from_date, to_date, group_id)
+
+    # --- Load ALL active employees for the period (include those with 0 checkins) ---
+    emp_q = db.query(Employee).filter(
+        Employee.active.is_(True),
+        Employee.deleted_at.is_(None),
+    )
+    if group_id is not None:
+        emp_q = emp_q.filter(Employee.group_id == group_id)
+    all_employees = emp_q.order_by(Employee.code.asc()).all()
+
+    # --- Pivot: {employee_id: {work_date: row}} ---
+    pivot: dict[int, dict[date, object]] = {emp.id: {} for emp in all_employees}
+    emp_meta: dict[int, tuple[str, str]] = {
+        emp.id: (emp.code, emp.full_name) for emp in all_employees
+    }
+
+    for row in rows:
+        eid = int(row.employee_id)
+        if eid not in pivot:
+            # employee visible via logs but not in current active filter — include anyway
+            pivot[eid] = {}
+            emp_meta[eid] = (row.employee_code, row.full_name)
+        pivot[eid][row.work_date] = row
+
+    # --- Build cell codes matrix ---
+    days = list(range(1, last_day + 1))
+    matrix: dict[int, list[str]] = {}
+    for eid in pivot:
+        emp_rows = pivot[eid]
+        codes: list[str] = []
+        for d in days:
+            day_date = date(year, month, d)
+            weekday = day_date.weekday()  # 5=Sat, 6=Sun
+            if weekday >= 5:
+                # Weekend — skip for K counting, but show actual code if worked
+                row = emp_rows.get(day_date)
+                if row is not None:
+                    # Worked on weekend — derive actual code
+                    is_holiday = day_date in holiday_set
+                    codes.append(_derive_cell_code(row, exception_map, {day_date} if is_holiday else set(), geofence_location_map))
+                else:
+                    codes.append("")  # weekend, no work
+            else:
+                row = emp_rows.get(day_date)
+                is_holiday = day_date in holiday_set
+                if row is None:
+                    leave_code = leave_map.get((eid, day_date))
+                    if leave_code == "P":
+                        # PAID leave always wins — even on public holidays (P beats L)
+                        codes.append("P")
+                    elif is_holiday:
+                        codes.append("L")
+                    else:
+                        # UNPAID leave or plain absent both map to K
+                        codes.append("K")
+                else:
+                    codes.append(_derive_cell_code(row, exception_map, {day_date} if is_holiday else set(), geofence_location_map))
+        matrix[eid] = codes
+
+    # --- Compute summaries ---
+    summaries: dict[int, dict] = {
+        eid: _calc_summary(codes) for eid, codes in matrix.items()
+    }
+
+    return _build_monthly_excel(
+        year=year,
+        month=month,
+        group_id=group_id,
+        all_employees=all_employees,
+        emp_meta=emp_meta,
+        days=days,
+        matrix=matrix,
+        summaries=summaries,
+        holiday_set=holiday_set,
+    )

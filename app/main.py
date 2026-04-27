@@ -11,6 +11,7 @@ from app.api.auth import router as auth_router
 from app.api.employees import router as employees_router
 from app.api.geofences import router as geofences_router
 from app.api.groups import router as groups_router
+from app.api.leave import router as leave_router
 from app.api.reports import router as reports_router
 from app.api.rules import router as rules_router
 from app.api.users import router as users_router
@@ -163,6 +164,7 @@ app.include_router(employees_router)
 app.include_router(groups_router)
 app.include_router(geofences_router)
 app.include_router(attendance_router)
+app.include_router(leave_router)
 app.include_router(reports_router)
 app.include_router(rules_router)
 app.include_router(auth_router)
