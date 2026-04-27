@@ -71,6 +71,7 @@ class GroupGeofence(Base):
     longitude = Column(Float, nullable=False)
     radius_m = Column(Integer, nullable=False, default=200)
     active = Column(Boolean, default=True, nullable=False)
+    location_type = Column(String(10), nullable=False, server_default="SITE")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -221,6 +222,15 @@ class ExceptionPolicy(Base):
     updated_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
 
+class PublicHoliday(Base):
+    __tablename__ = "public_holidays"
+
+    id = Column(Integer, primary_key=True)
+    date = Column(Date, nullable=False, unique=True)
+    name = Column(String(100), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class AttendanceExceptionNotification(Base):
     __tablename__ = "attendance_exception_notifications"
     __table_args__ = (
@@ -240,4 +250,19 @@ class AttendanceExceptionNotification(Base):
     error_message = Column(Text, nullable=True)
     metadata_json = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class LeaveRequest(Base):
+    __tablename__ = "leave_requests"
+
+    id = Column(Integer, primary_key=True)
+    employee_id = Column(Integer, ForeignKey("employees.id"), nullable=False, index=True)
+    leave_type = Column(String(20), nullable=False)  # PAID | UNPAID
+    start_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=False)
+    reason = Column(Text, nullable=True)
+    status = Column(String(20), nullable=False, server_default="PENDING")  # PENDING | APPROVED | REJECTED
+    admin_note = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

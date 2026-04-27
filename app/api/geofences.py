@@ -41,6 +41,7 @@ def list_all_geofences(
             "radius_meters": gf.radius_m,
             "active": gf.active,
             "is_active": gf.active,
+            "location_type": gf.location_type,
             "group_id": gf.group_id,
             "group_name": group_name,
             "member_count": member_counts.get(gf.group_id, 0),
