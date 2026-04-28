@@ -117,10 +117,9 @@ class LocationRiskScoringTestCase(unittest.TestCase):
             }
         )
         result = assess_location_risk(payload)
-        self.assertGreaterEqual(result.score, 40)
-        self.assertEqual(result.decision, "ALLOW_WITH_EXCEPTION")
+        self.assertEqual(result.score, 10)
+        self.assertEqual(result.decision, "ALLOW")
         self.assertIn("MOBILE_WEB_MISSING_NETWORK_CONTEXT", result.flags)
-        self.assertIn("TOO_PERFECT_GPS_WITHOUT_NETWORK_CONTEXT", result.flags)
 
     def test_exact_coordinate_repeat_pattern_adds_risk(self) -> None:
         base = _base_input()

@@ -162,6 +162,15 @@ _PUSH_BODIES: dict[str, str] = {
     "exception_expired_employee": "Ngoại lệ chấm công đã hết hạn mà chưa được giải trình.",
 }
 
+_PUSH_ROUTES: dict[str, str] = {
+    "exception_detected_employee": "/home/exceptions",
+    "exception_detected_admin": "/admin/exceptions",
+    "exception_submitted_admin": "/admin/exceptions",
+    "exception_approved_employee": "/home/exceptions",
+    "exception_rejected_employee": "/home/exceptions",
+    "exception_expired_employee": "/home/exceptions",
+}
+
 
 def send_exception_notification_background(
     payload: ExceptionNotificationMail,
@@ -191,7 +200,9 @@ def send_exception_notification_background(
 
             title = _PUSH_TITLES.get(payload.event_type, "Thông báo chấm công")
             body = _PUSH_BODIES.get(payload.event_type, "")
-            send_push_notification(fcm_token.strip(), title, body)
+            route = _PUSH_ROUTES.get(payload.event_type, "")
+            data = {"route": route} if route else None
+            send_push_notification(fcm_token.strip(), title, body, data=data)
             if email_failed:
                 logger.info(
                     "FCM push sent despite email failure. event=%s", payload.event_type

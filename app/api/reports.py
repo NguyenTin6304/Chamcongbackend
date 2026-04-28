@@ -291,12 +291,20 @@ def _build_exception_map(
     if to_date:
         q = q.filter(AttendanceException.work_date <= to_date)
 
+    q = q.order_by(AttendanceException.id.asc())
+
     status_map: dict[tuple[int, date], tuple[str, str]] = {}
     for row in q.all():
         key = (row.employee_id, row.work_date)
         current = status_map.get(key)
         normalized_status = normalize_exception_status(row.status)
-        if current is None or not is_pending_exception_status(current[0]):
+        if current is None:
+            status_map[key] = (normalized_status, row.exception_type)
+        elif not is_pending_exception_status(current[0]):
+            # Current is resolved — overwrite with anything newer
+            status_map[key] = (normalized_status, row.exception_type)
+        elif row.exception_type == "MISSED_CHECKOUT" and current[1] != "MISSED_CHECKOUT":
+            # Both pending, but MISSED_CHECKOUT takes priority for display (shows 1/2T)
             status_map[key] = (normalized_status, row.exception_type)
     return status_map
 
@@ -2113,12 +2121,6 @@ def _derive_cell_code(row, exception_map: dict, holiday_set: set, geofence_locat
 
     # row exists → has checkin
     exc_status, exc_type = exception_map.get((row.employee_id, row.work_date), (None, None))
-    if exc_type == "MISSED_CHECKOUT":
-        return "1/2T"
-
-    punctuality = _rank_to_punctuality(row.punctuality_rank)
-    if punctuality == "LATE":
-        return "1/2T"
 
     geo_name = row.checkin_matched_geofence or row.checkout_matched_geofence
     geo_location_type = (
@@ -2126,6 +2128,25 @@ def _derive_cell_code(row, exception_map: dict, holiday_set: set, geofence_locat
         if geo_name else None
     )
     geo_type = _geofence_type(geo_name, geo_location_type)
+
+    # Priority 1: public holiday — full credit for any check-in, no hours/punctuality check.
+    if holiday_set:
+        if geo_type == "VP":
+            return "V"
+        if geo_type == "SITE":
+            return "S"
+        return "X"
+
+    # Priority 2: MISSED_CHECKOUT / LARGE_TIME_DEVIATION (not approved) → 1/2T
+    if exc_type in ("MISSED_CHECKOUT", "LARGE_TIME_DEVIATION") and exc_status != "APPROVED":
+        return "1/2T"
+
+    # Priority 3: late check-in → 1/2T
+    punctuality = _rank_to_punctuality(row.punctuality_rank)
+    if punctuality == "LATE":
+        return "1/2T"
+
+    # Priority 4: full / half day by geofence type and actual hours worked
     shift_start = row.shift_start or time(8, 0)
     shift_end = row.shift_end or time(17, 0)
     regular_minutes, _, _ = split_regular_overtime_minutes(
@@ -2141,7 +2162,6 @@ def _derive_cell_code(row, exception_map: dict, holiday_set: set, geofence_locat
         return "V" if full_day else "1/2V"
     if geo_type == "SITE":
         return "S" if full_day else "1/2S"
-    # SYSTEM_RULE
     return "X" if full_day else "1/2T"
 
 
@@ -2188,7 +2208,7 @@ _HDR_FILL     = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type=
 _SUBHDR_FILL  = PatternFill(start_color="DBEAFE", end_color="DBEAFE", fill_type="solid")
 _SUM_FILL     = PatternFill(start_color="ECFDF5", end_color="ECFDF5", fill_type="solid")
 
-_SUMMARY_HEADERS = ["Ngày công", "Tại VP", "Tại Site", "Nghỉ lễ (L)", "Nghỉ lương (P)", "Vắng (K)"]
+_SUMMARY_HEADERS = ["Ngày công", "Tại VP (V)", "Tại Site (S)", "Nghỉ lễ (L)", "Nghỉ lương (P)", "Vắng (K)"]
 _SUMMARY_KEYS    = ["ngay_cong", "tai_vp", "tai_site", "nghi_le", "nghi_p", "vang_k"]
 _SUMMARY_WIDTHS  = [10, 9, 9, 11, 13, 9]
 
@@ -2201,7 +2221,7 @@ _LEGEND_ITEMS = [
     ("1/2T", "Đi trễ hoặc quên chấm công"),
     ("K",    "Vắng không lương"),
     ("L",    "Nghỉ lễ"),
-    ("P",    "Nghỉ có lương (chờ module nghỉ phép)"),
+    ("P",    "Nghỉ có lương"),
 ]
 
 _CENTER  = Alignment(horizontal="center", vertical="center")
@@ -2505,7 +2525,8 @@ def export_monthly_attendance_excel(
                     is_holiday = day_date in holiday_set
                     codes.append(_derive_cell_code(row, exception_map, {day_date} if is_holiday else set(), geofence_location_map))
                 else:
-                    codes.append("")  # weekend, no work
+                    # No checkin: show L if public holiday, blank otherwise
+                    codes.append("L" if day_date in holiday_set else "")
             else:
                 row = emp_rows.get(day_date)
                 is_holiday = day_date in holiday_set
