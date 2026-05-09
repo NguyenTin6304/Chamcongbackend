@@ -25,7 +25,17 @@ class LocationRequest(BaseModel):
     # Accept both {lat,lng} and {latitude,longitude}
     lat: float = Field(validation_alias=AliasChoices("lat", "latitude"), ge=-90, le=90)
     lng: float = Field(validation_alias=AliasChoices("lng", "longitude"), ge=-180, le=180)
-    accuracy_m: float | None = Field(default=None, gt=0, le=5000)
+    # NOTE on accuracy_m bounds:
+    #   Pydantic validation here is sanity-only — reject genuinely impossible
+    #   values (≤0 or absurdly large). Quality of accuracy is graded by
+    #   `app/services/location_risk.py` (BAD_ACCURACY +20 score when >100m).
+    #
+    #   Why the upper bound is 100_000 (100 km), not 5000:
+    #   Desktop browsers without GPS rely on WiFi/IP geolocation which often
+    #   reports 5–10 km, and rural IP-only fallback can legitimately report
+    #   30–80 km. The previous `le=5000` rejected real desktop checkins with
+    #   422 "Invalid request data" before the risk engine ever saw the request.
+    accuracy_m: float | None = Field(default=None, gt=0, le=100_000)
     timestamp_client: datetime | None = None
 
 
@@ -186,6 +196,10 @@ class AttendanceExceptionSubmitExplanationRequest(BaseModel):
 class AttendanceExceptionApproveRequest(BaseModel):
     admin_note: str | None = Field(default=None, max_length=2000)
     actual_checkout_time: datetime | None = None
+    # Phase 2.5 — combined OT decision when approving MISSED_CHECKOUT/AUTO_CLOSED.
+    # If null, no OT record is created. If set, an OT record is created (or updated)
+    # with status=APPROVED and approved_minutes=this value.
+    approved_overtime_minutes: int | None = Field(default=None, ge=0, le=24 * 60)
 
 
 class AttendanceExceptionRejectRequest(BaseModel):
@@ -194,3 +208,33 @@ class AttendanceExceptionRejectRequest(BaseModel):
 
 class AttendanceExceptionExtendDeadlineRequest(BaseModel):
     extend_hours: int = Field(ge=1, le=168)  # 1 hour to 1 week per extension
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 4 — Employee monthly self stats
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MyMonthlyStatsResponse(BaseModel):
+    month: str  # YYYY-MM (e.g. "2026-05")
+    period_start: date
+    period_end: date  # capped at today for the current month
+
+    # Attendance counts (each is a count of distinct work_dates)
+    checkins_total: int
+    checkins_on_time: int
+    checkins_late: int
+    checkins_early: int
+    absent_days: int
+    working_days: int  # weekdays in period minus holidays minus approved leave days
+
+    # Leave
+    leave_days_used: float    # approved leave days that overlap the month
+    leave_days_pending: float
+    annual_quota: float | None     # null = unlimited
+    leave_balance_remaining: float | None  # null = unlimited
+
+    # Hours (Plan B: worked = regular + approved OT)
+    total_worked_minutes: int
+    total_regular_minutes: int
+    total_approved_overtime_minutes: int
+    total_pending_overtime_minutes: int

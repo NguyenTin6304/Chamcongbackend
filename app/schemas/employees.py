@@ -22,6 +22,7 @@ class EmployeeCreateRequest(BaseModel):
     phone: Optional[str] = None
     user_id: Optional[int] = None
     group_id: Optional[int] = None
+    annual_leave_days: Optional[float] = None  # None → use company default
 
     @field_validator("phone")
     @classmethod
@@ -43,6 +44,7 @@ class EmployeeUpdateRequest(BaseModel):
     group_id: Optional[int] = None
     user_id: Optional[int] = None
     active: Optional[bool] = None
+    annual_leave_days: Optional[float] = None  # send -1.0 to set unlimited (NULL)
 
     @field_validator("phone")
     @classmethod
@@ -59,6 +61,7 @@ class EmployeeResponse(BaseModel):
     group_id: Optional[int] = None
     group_name: Optional[str] = None
     active: bool = True
+    annual_leave_days: Optional[float] = None
     resigned_at: Optional[datetime] = None
     joined_at: Optional[datetime] = None
 

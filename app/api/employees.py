@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_admin
-from app.models import AttendanceLog, Employee, Group, User
+from app.models import AttendanceLog, CheckinRule, Employee, Group, User
 from app.schemas.employees import (
     EmployeeAssignGroupRequest,
     EmployeeAssignUserRequest,
@@ -51,12 +51,20 @@ def create_employee(
     _validate_user_mapping(db, employee_id=None, user_id=payload.user_id)
     _validate_group_exists(db, payload.group_id)
 
+    # Resolve annual_leave_days: use explicit value if provided, else company default
+    annual_leave_days = payload.annual_leave_days
+    if annual_leave_days is None:
+        active_rule = db.query(CheckinRule).filter(CheckinRule.active.is_(True)).first()
+        if active_rule is not None:
+            annual_leave_days = active_rule.default_annual_leave_days
+
     emp = Employee(
         code=payload.code,
         full_name=payload.full_name,
         phone=payload.phone,
         user_id=payload.user_id,
         group_id=payload.group_id,
+        annual_leave_days=annual_leave_days,
     )
 
     try:
@@ -161,6 +169,13 @@ def update_employee(
 
     if "active" in payload.model_fields_set and payload.active is not None:
         emp.active = payload.active
+
+    if "annual_leave_days" in payload.model_fields_set:
+        # -1.0 is the sentinel for "set to unlimited (NULL)"
+        if payload.annual_leave_days is not None and payload.annual_leave_days < 0:
+            emp.annual_leave_days = None
+        else:
+            emp.annual_leave_days = payload.annual_leave_days
 
     db.commit()
     db.refresh(emp)

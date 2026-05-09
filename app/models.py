@@ -86,6 +86,7 @@ class Employee(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True, unique=True)
     group_id = Column(Integer, ForeignKey("groups.id"), nullable=True, index=True)
     active = Column(Boolean, default=True, nullable=False, server_default="true")
+    annual_leave_days = Column(Float, nullable=True)  # NULL = unlimited
     deleted_at = Column(DateTime(timezone=True), nullable=True, default=None)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -117,6 +118,9 @@ class CheckinRule(Base):
     checkout_grace_minutes = Column(Integer, nullable=False, default=0)
     # Fallback work-date cutoff in minutes from 00:00 VN.
     cross_day_cutoff_minutes = Column(Integer, nullable=False, default=240)
+    default_annual_leave_days = Column(Float, nullable=False, default=12.0, server_default='12.0')
+    overtime_enabled = Column(Boolean, nullable=False, default=True, server_default='true')
+    overtime_minimum_minutes = Column(Integer, nullable=False, default=30, server_default='30')
     active = Column(Boolean, default=True, nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -265,4 +269,56 @@ class LeaveRequest(Base):
     admin_note = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class OvertimeRecord(Base):
+    """Phase 2.5 — admin-approved overtime tracking.
+
+    One record per (employee, work_date). raw_minutes is computed at checkout
+    or exception approval; approved_minutes is set by admin (may differ from raw).
+    payable OT for reports = approved_minutes when status=APPROVED, else 0.
+    """
+    __tablename__ = "overtime_records"
+    __table_args__ = (
+        UniqueConstraint("employee_id", "work_date", name="uq_overtime_employee_workdate"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    employee_id = Column(Integer, ForeignKey("employees.id"), nullable=False, index=True)
+    work_date = Column(Date, nullable=False, index=True)
+    attendance_log_id = Column(Integer, ForeignKey("attendance_logs.id"), nullable=True)
+
+    raw_minutes = Column(Integer, nullable=False)
+    approved_minutes = Column(Integer, nullable=True)
+    status = Column(String(20), nullable=False, server_default="PENDING")  # PENDING | APPROVED | REJECTED
+    source = Column(String(30), nullable=False, server_default="AUTO_CHECKOUT")  # AUTO_CHECKOUT | EXCEPTION_APPROVAL
+
+    employee_note = Column(Text, nullable=True)
+    admin_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    admin_note = Column(Text, nullable=True)
+    decided_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Snapshot of shift definition at create time (rule changes later don't affect this record)
+    shift_start_snapshot = Column(Time, nullable=True)
+    shift_end_snapshot = Column(Time, nullable=True)
+    is_weekend = Column(Boolean, nullable=False, server_default="false")
+    is_holiday = Column(Boolean, nullable=False, server_default="false")
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class OvertimeAudit(Base):
+    """Audit trail for overtime_records — every state/value change."""
+    __tablename__ = "overtime_audits"
+
+    id = Column(Integer, primary_key=True)
+    overtime_id = Column(Integer, ForeignKey("overtime_records.id", ondelete="CASCADE"), nullable=False, index=True)
+    action = Column(String(30), nullable=False)  # CREATED | APPROVED | REJECTED | EDITED
+    actor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    from_status = Column(String(20), nullable=True)
+    to_status = Column(String(20), nullable=True)
+    from_minutes = Column(Integer, nullable=True)
+    to_minutes = Column(Integer, nullable=True)
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
