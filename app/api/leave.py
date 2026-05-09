@@ -1,3 +1,4 @@
+import threading
 from datetime import date, timedelta, timezone, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -8,6 +9,8 @@ from app.core.deps import get_current_user, require_admin
 from app.services.attendance_time import VN_TZ
 from app.models import Employee, LeaveRequest, User
 from app.schemas.leave import (
+    AdminLeaveRequestCreate,
+    LeaveBalanceResponse,
     LeaveRequestApproveRequest,
     LeaveRequestCreate,
     LeaveRequestRejectRequest,
@@ -16,7 +19,40 @@ from app.schemas.leave import (
 
 router = APIRouter(prefix="/leave-requests", tags=["leave"])
 
-_PAST_GRACE_DAYS = 3  # NV được phép xin nghỉ tối đa 3 ngày trước ngày hôm nay
+_PAST_GRACE_DAYS = 3
+
+# ---------------------------------------------------------------------------
+# FCM helpers
+# ---------------------------------------------------------------------------
+
+_LEAVE_FCM: dict[str, tuple[str, str]] = {
+    "approved": ("Đơn nghỉ phép đã được duyệt ✅", "Đơn nghỉ phép của bạn đã được phê duyệt."),
+    "rejected": ("Đơn nghỉ phép bị từ chối ❌", "Đơn nghỉ phép của bạn bị từ chối. Vui lòng xem chi tiết."),
+    "admin_created": ("Đơn nghỉ phép đã được tạo", "Quản trị viên đã tạo đơn nghỉ phép cho bạn."),
+}
+
+
+def _push_leave_fcm(fcm_token: str, event: str) -> None:
+    try:
+        from app.services.fcm_service import send_push_notification
+        title, body = _LEAVE_FCM.get(event, ("Thông báo nghỉ phép", ""))
+        send_push_notification(fcm_token, title, body, data={"route": "/home/leaves"})
+    except Exception as fcm_exc:
+        # Daemon threads swallow stack traces by default — log explicitly so a
+        # misconfigured FCM key doesn't go unnoticed in production.
+        import logging
+        logging.getLogger(__name__).warning(
+            "Leave FCM push failed (event=%s): %s", event, fcm_exc,
+        )
+
+
+def _fire_leave_fcm(employee: Employee, db: Session, event: str) -> None:
+    if not employee.user_id:
+        return
+    user = db.query(User).filter(User.id == employee.user_id).first()
+    if user and user.fcm_token and user.fcm_token.strip():
+        token = user.fcm_token.strip()
+        threading.Thread(target=_push_leave_fcm, args=(token, event), daemon=True).start()  # NV được phép xin nghỉ tối đa 3 ngày trước ngày hôm nay
 
 
 def _to_response(req: LeaveRequest, employee: Employee) -> LeaveRequestResponse:
@@ -63,8 +99,66 @@ def _check_overlap(db: Session, employee_id: int, start_date: date, end_date: da
 
 
 # ---------------------------------------------------------------------------
+# Balance helpers
+# ---------------------------------------------------------------------------
+
+def compute_leave_balance(emp: Employee, db: Session, year: int) -> LeaveBalanceResponse:
+    """Compute annual leave balance for `emp` in `year`.
+
+    Public so other modules (e.g. /attendance/me/stats) can reuse the same
+    semantics — `days_used` and `days_remaining` must agree across endpoints.
+    """
+    year_start = date(year, 1, 1)
+    year_end = date(year, 12, 31)
+
+    def _day_count_in_year(req: LeaveRequest) -> float:
+        effective_start = max(req.start_date, year_start)
+        effective_end = min(req.end_date, year_end)
+        return float((effective_end - effective_start).days + 1)
+
+    approved = db.query(LeaveRequest).filter(
+        LeaveRequest.employee_id == emp.id,
+        LeaveRequest.leave_type == 'PAID',
+        LeaveRequest.status == 'APPROVED',
+        LeaveRequest.start_date <= year_end,
+        LeaveRequest.end_date >= year_start,
+    ).all()
+    days_used = sum(_day_count_in_year(r) for r in approved)
+
+    pending = db.query(LeaveRequest).filter(
+        LeaveRequest.employee_id == emp.id,
+        LeaveRequest.leave_type == 'PAID',
+        LeaveRequest.status == 'PENDING',
+        LeaveRequest.start_date <= year_end,
+        LeaveRequest.end_date >= year_start,
+    ).all()
+    days_pending = sum(_day_count_in_year(r) for r in pending)
+
+    quota = emp.annual_leave_days
+    remaining = None if quota is None else max(0.0, quota - days_used)
+
+    return LeaveBalanceResponse(
+        annual_quota=quota,
+        days_used=days_used,
+        days_remaining=remaining,
+        days_pending=days_pending,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Employee endpoints
 # ---------------------------------------------------------------------------
+
+@router.get("/me/balance", response_model=LeaveBalanceResponse)
+def get_my_leave_balance(
+    year: int | None = Query(default=None, ge=2000, le=2100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    emp = _get_employee_for_user(current_user, db)
+    target_year = year or datetime.now(VN_TZ).year
+    return compute_leave_balance(emp, db, target_year)
+
 
 @router.post("", response_model=LeaveRequestResponse, status_code=201)
 def create_leave_request(
@@ -120,6 +214,23 @@ def get_my_leave_requests(
 # Admin endpoints
 # ---------------------------------------------------------------------------
 
+@router.get("/balance/{employee_id}", response_model=LeaveBalanceResponse)
+def get_employee_leave_balance(
+    employee_id: int,
+    year: int | None = Query(default=None, ge=2000, le=2100),
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    emp = db.query(Employee).filter(
+        Employee.id == employee_id,
+        Employee.deleted_at.is_(None),
+    ).first()
+    if emp is None:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    target_year = year or datetime.now(VN_TZ).year
+    return compute_leave_balance(emp, db, target_year)
+
+
 @router.get("", response_model=list[LeaveRequestResponse])
 def list_leave_requests(
     status: str | None = Query(default=None),
@@ -157,6 +268,38 @@ def list_leave_requests(
     return [_to_response(req, emp) for req, emp in rows]
 
 
+@router.post("/admin", response_model=LeaveRequestResponse, status_code=201)
+def admin_create_leave_request(
+    payload: AdminLeaveRequestCreate,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    emp = db.query(Employee).filter(
+        Employee.id == payload.employee_id,
+        Employee.deleted_at.is_(None),
+    ).first()
+    if emp is None:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    _check_overlap(db, emp.id, payload.start_date, payload.end_date)
+
+    req = LeaveRequest(
+        employee_id=emp.id,
+        leave_type=payload.leave_type,
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+        reason=payload.reason,
+        status=payload.status,
+        admin_note="Tạo bởi quản trị viên" if payload.status == "APPROVED" else None,
+    )
+    db.add(req)
+    db.commit()
+    db.refresh(req)
+    if payload.status == "APPROVED":
+        _fire_leave_fcm(emp, db, "admin_created")
+    return _to_response(req, emp)
+
+
 @router.patch("/{leave_id}/approve", response_model=LeaveRequestResponse)
 def approve_leave_request(
     leave_id: int,
@@ -177,6 +320,7 @@ def approve_leave_request(
     db.refresh(req)
 
     emp = db.query(Employee).filter(Employee.id == req.employee_id).first()
+    _fire_leave_fcm(emp, db, "approved")
     return _to_response(req, emp)
 
 
@@ -200,4 +344,5 @@ def reject_leave_request(
     db.refresh(req)
 
     emp = db.query(Employee).filter(Employee.id == req.employee_id).first()
+    _fire_leave_fcm(emp, db, "rejected")
     return _to_response(req, emp)

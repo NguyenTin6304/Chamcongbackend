@@ -11,8 +11,8 @@ from sqlalchemy.orm import Session, aliased
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_admin
-from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, ExceptionPolicy, Group, GroupGeofence, User
-from app.schemas.attendance import AttendanceDailyReportResponse, AttendanceLogResponse, AttendanceStatusResponse, CheckActionResponse, LocationRequest
+from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, ExceptionPolicy, Group, GroupGeofence, LeaveRequest, OvertimeRecord, PublicHoliday, User
+from app.schemas.attendance import AttendanceDailyReportResponse, AttendanceLogResponse, AttendanceStatusResponse, CheckActionResponse, LocationRequest, MyMonthlyStatsResponse
 from app.services.attendance_time import (
     DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
     VN_TZ,
@@ -41,6 +41,7 @@ from app.services.attendance_exception_notifications import (
     send_exception_notification_background,
 )
 from app.services.location_risk import LocationRiskInput, assess_location_risk
+from app.services.overtime_service import auto_create_pending_ot, fetch_payable_minutes_map
 from app.services.report_consistency import (
     compute_distance_consistency_warning,
     load_group_geofence_radius_maps,
@@ -968,18 +969,6 @@ def _apply_exception_to_attendance_state(
     return attendance_state
 
 
-def _compute_payable_overtime_minutes(
-    overtime_minutes: int | None,
-    exception_status: str | None,
-    exception_type: str | None,
-) -> int | None:
-    if overtime_minutes is None:
-        return None
-    if is_pending_timesheet_exception(exception_status, exception_type):
-        return 0
-    return overtime_minutes
-
-
 @router.get("/status", response_model=AttendanceStatusResponse)
 def my_attendance_status(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     emp = _find_employee_for_user(db, user)
@@ -1494,6 +1483,21 @@ def checkout(
         _notify_new_exception(background_tasks, db, exception=new_exception, employee=emp)
         db.commit()
 
+    # Phase 2.5 — auto-create OT record if checkout exceeds shift end by threshold.
+    # Best-effort: failures here must not block a successful checkout. The
+    # checkout log itself is already committed above; this is a separate
+    # transaction so a rollback only discards the unflushed OT row.
+    try:
+        auto_create_pending_ot(db, log, checkin_log=open_checkin)
+        db.commit()
+    except Exception as ot_exc:
+        db.rollback()
+        import logging
+        logging.getLogger(__name__).warning(
+            "auto_create_pending_ot failed for employee=%s work_date=%s: %s",
+            emp.id, log.work_date, ot_exc,
+        )
+
     msg = f"Check-out thành công ({checkout_status}) cho ngày công {_format_vn_date(work_date)}."
     if out_of_range:
         msg = (
@@ -1537,6 +1541,228 @@ def my_logs(
 
     logs = q.order_by(AttendanceLog.time.desc()).all()
     return [_to_log_response(x) for x in logs]
+
+
+@router.get("/me/stats", response_model=MyMonthlyStatsResponse)
+def my_monthly_stats(
+    month: str | None = None,  # YYYY-MM; defaults to current month in VN time
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Phase 4 — Employee self stats for one month.
+
+    Returns attendance counts, leave usage, leave balance, and Plan-B
+    worked-minute totals (regular + approved OT) for the given month.
+    """
+    emp = _get_employee_for_user(db, user)
+
+    # ── Resolve target month ──────────────────────────────────────────────
+    if month is None:
+        today_vn = datetime.now(VN_TZ).date()
+        target_year, target_month = today_vn.year, today_vn.month
+    else:
+        try:
+            target_year, target_month = map(int, month.split("-", 1))
+            if not (2000 <= target_year <= 2100 and 1 <= target_month <= 12):
+                raise ValueError
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=422, detail="month must be YYYY-MM")
+
+    period_start = date(target_year, target_month, 1)
+    if target_month == 12:
+        next_first = date(target_year + 1, 1, 1)
+    else:
+        next_first = date(target_year, target_month + 1, 1)
+    period_last_day_of_month = next_first - timedelta(days=1)
+
+    today_vn = datetime.now(VN_TZ).date()
+    period_end = min(period_last_day_of_month, today_vn)
+    if period_end < period_start:
+        # Future month: nothing to count yet, but return empty stats.
+        period_end = period_start - timedelta(days=1)
+
+    # ── Attendance counts (per work_date IN-log) ──────────────────────────
+    in_logs = (
+        db.query(
+            AttendanceLog.work_date,
+            AttendanceLog.punctuality_status,
+        )
+        .filter(
+            AttendanceLog.employee_id == emp.id,
+            AttendanceLog.type == "IN",
+            AttendanceLog.work_date >= period_start,
+            AttendanceLog.work_date <= period_last_day_of_month,
+        )
+        .all()
+    )
+
+    checkin_dates: set[date] = set()
+    on_time_dates: set[date] = set()
+    late_dates: set[date] = set()
+    early_dates: set[date] = set()
+    for wd, status in in_logs:
+        if wd is None:
+            continue
+        checkin_dates.add(wd)
+        if status == "ON_TIME":
+            on_time_dates.add(wd)
+        elif status == "LATE":
+            late_dates.add(wd)
+        elif status == "EARLY":
+            early_dates.add(wd)
+
+    # ── Holidays in the period ────────────────────────────────────────────
+    holidays_in_period = {
+        h.date
+        for h in db.query(PublicHoliday)
+        .filter(PublicHoliday.date >= period_start, PublicHoliday.date <= period_end)
+        .all()
+    }
+
+    # ── Approved leave days that overlap the period ───────────────────────
+    overlapping_leaves = (
+        db.query(LeaveRequest)
+        .filter(
+            LeaveRequest.employee_id == emp.id,
+            LeaveRequest.status == "APPROVED",
+            LeaveRequest.start_date <= period_last_day_of_month,
+            LeaveRequest.end_date >= period_start,
+        )
+        .all()
+    )
+    leave_days_in_period: set[date] = set()
+    leave_days_used = 0.0
+    for req in overlapping_leaves:
+        eff_start = max(req.start_date, period_start)
+        eff_end = min(req.end_date, period_last_day_of_month)
+        cur = eff_start
+        while cur <= eff_end:
+            leave_days_in_period.add(cur)
+            cur += timedelta(days=1)
+        # leave days used count uses paid leave only for balance accuracy;
+        # for monthly summary, count all approved leave days within the month.
+        leave_days_used += float((eff_end - eff_start).days + 1)
+
+    pending_leaves = (
+        db.query(LeaveRequest)
+        .filter(
+            LeaveRequest.employee_id == emp.id,
+            LeaveRequest.status == "PENDING",
+            LeaveRequest.start_date <= period_last_day_of_month,
+            LeaveRequest.end_date >= period_start,
+        )
+        .all()
+    )
+    leave_days_pending = 0.0
+    for req in pending_leaves:
+        eff_start = max(req.start_date, period_start)
+        eff_end = min(req.end_date, period_last_day_of_month)
+        leave_days_pending += float((eff_end - eff_start).days + 1)
+
+    # ── Working days (weekdays in [start, end] minus holidays/leaves) ─────
+    working_days = 0
+    cur = period_start
+    while cur <= period_end:
+        is_weekend = cur.weekday() >= 5
+        if not is_weekend and cur not in holidays_in_period and cur not in leave_days_in_period:
+            working_days += 1
+        cur += timedelta(days=1)
+
+    checkins_total = len(checkin_dates)
+    absent_days = max(0, working_days - checkins_total)
+
+    # ── Worked minutes (regular + approved OT) ────────────────────────────
+    # Pair up IN/OUT logs by work_date and compute regular minutes per pair.
+    pair_logs = (
+        db.query(AttendanceLog)
+        .filter(
+            AttendanceLog.employee_id == emp.id,
+            AttendanceLog.work_date >= period_start,
+            AttendanceLog.work_date <= period_last_day_of_month,
+            AttendanceLog.type.in_(["IN", "OUT"]),
+        )
+        .order_by(AttendanceLog.work_date.asc(), AttendanceLog.time.asc())
+        .all()
+    )
+
+    by_date: dict[date, dict[str, AttendanceLog]] = {}
+    for log in pair_logs:
+        if log.work_date is None:
+            continue
+        bucket = by_date.setdefault(log.work_date, {})
+        if log.type == "IN" and "in" not in bucket:
+            bucket["in"] = log
+        elif log.type == "OUT":
+            # keep the latest OUT for the day
+            bucket["out"] = log
+
+    rule = _get_active_rule(db)
+    default_start = rule.start_time if rule else time(8, 0)
+    default_end = rule.end_time if rule else time(17, 0)
+
+    total_regular_minutes = 0
+    for wd, bucket in by_date.items():
+        in_log = bucket.get("in")
+        out_log = bucket.get("out")
+        if in_log is None or out_log is None:
+            continue
+        shift_start = (in_log.snapshot_start_time or default_start)
+        shift_end = (in_log.snapshot_end_time or default_end)
+        regular, _, _ = split_regular_overtime_minutes(
+            wd, in_log.time, out_log.time, shift_start, shift_end,
+        )
+        total_regular_minutes += regular
+
+    payable_map = fetch_payable_minutes_map(
+        db,
+        employee_ids=[emp.id],
+        from_date=period_start,
+        to_date=period_last_day_of_month,
+    )
+    total_approved_overtime_minutes = sum(payable_map.values())
+
+    # Pending OT: sum raw_minutes for status='PENDING' in the month
+    pending_rows = (
+        db.query(OvertimeRecord.raw_minutes)
+        .filter(
+            OvertimeRecord.employee_id == emp.id,
+            OvertimeRecord.status == "PENDING",
+            OvertimeRecord.work_date >= period_start,
+            OvertimeRecord.work_date <= period_last_day_of_month,
+        )
+        .all()
+    )
+    total_pending_overtime_minutes = sum(int(r[0] or 0) for r in pending_rows)
+
+    total_worked_minutes = total_regular_minutes + total_approved_overtime_minutes
+
+    # ── Leave balance for the year of this month ──────────────────────────
+    # Delegate to the canonical helper in leave.py so /attendance/me/stats and
+    # /leave-requests/me/balance can never disagree on remaining quota.
+    from app.api.leave import compute_leave_balance
+    balance = compute_leave_balance(emp, db, target_year)
+    quota = balance.annual_quota
+    balance_remaining = balance.days_remaining
+
+    return MyMonthlyStatsResponse(
+        month=f"{target_year:04d}-{target_month:02d}",
+        period_start=period_start,
+        period_end=period_end,
+        checkins_total=checkins_total,
+        checkins_on_time=len(on_time_dates),
+        checkins_late=len(late_dates),
+        checkins_early=len(early_dates),
+        absent_days=absent_days,
+        working_days=working_days,
+        leave_days_used=leave_days_used,
+        leave_days_pending=leave_days_pending,
+        annual_quota=quota,
+        leave_balance_remaining=balance_remaining,
+        total_worked_minutes=total_worked_minutes,
+        total_regular_minutes=total_regular_minutes,
+        total_approved_overtime_minutes=total_approved_overtime_minutes,
+        total_pending_overtime_minutes=total_pending_overtime_minutes,
+    )
 
 
 @router.get("/report/daily", response_model=list[AttendanceDailyReportResponse])
@@ -1657,6 +1883,15 @@ def daily_report_admin(
     group_ids = {int(row.group_id) for row in rows if row.group_id is not None}
     geofence_radius_map, group_max_radius_map = load_group_geofence_radius_maps(db, group_ids)
 
+    # Plan B: payable OT = approved_minutes from OvertimeRecord (not raw OT).
+    employee_ids_in_rows = list({int(row.employee_id) for row in rows if row.employee_id is not None})
+    payable_ot_map = fetch_payable_minutes_map(
+        db,
+        employee_ids=employee_ids_in_rows or None,
+        from_date=from_date,
+        to_date=to_date,
+    )
+
     response: list[AttendanceDailyReportResponse] = []
     for row in rows:
         checkin_status, checkout_status, attendance_state = _derive_daily_status(
@@ -1682,11 +1917,7 @@ def daily_report_admin(
             exception_status=exception_status,
             exception_type=exception_type,
         )
-        payable_overtime_minutes = _compute_payable_overtime_minutes(
-            overtime_minutes=overtime_minutes,
-            exception_status=exception_status,
-            exception_type=exception_type,
-        )
+        payable_overtime_minutes = payable_ot_map.get((int(row.employee_id), row.work_date), 0)
 
         matched_geofence = row.checkin_matched_geofence or row.checkout_matched_geofence
         geofence_source = _rank_to_geofence_source(row.geofence_source_rank)
