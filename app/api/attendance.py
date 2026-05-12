@@ -69,7 +69,10 @@ class _EffectiveTimeRule(NamedTuple):
 
 
 def _find_employee_for_user(db: Session, user: User) -> Employee | None:
-    return db.query(Employee).filter(Employee.user_id == user.id).first()
+    return db.query(Employee).filter(
+        Employee.user_id == user.id,
+        Employee.deleted_at.is_(None),
+    ).first()
 
 
 def _get_employee_for_user(db: Session, user: User) -> Employee:

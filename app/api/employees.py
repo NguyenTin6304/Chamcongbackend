@@ -26,7 +26,10 @@ def _validate_user_mapping(db: Session, employee_id: int | None, user_id: int | 
     if not user:
         raise HTTPException(status_code=400, detail="user_id không tồn tại")
 
-    query = db.query(Employee).filter(Employee.user_id == user_id)
+    query = db.query(Employee).filter(
+        Employee.user_id == user_id,
+        Employee.deleted_at.is_(None),
+    )
     if employee_id is not None:
         query = query.filter(Employee.id != employee_id)
     existed_emp = query.first()
