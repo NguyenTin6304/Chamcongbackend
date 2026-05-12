@@ -12,6 +12,12 @@ os.environ.setdefault("SECRET_KEY", "test-secret-key-at-least-16")
 os.environ.setdefault("ALGORITHM", "HS256")
 os.environ.setdefault("ACCESS_TOKEN_EXPIRE_MINUTES", "60")
 os.environ.setdefault("EXCEPTION_WORKFLOW_SYSTEM_KEY", "test-exception-system-key")
+os.environ["RECAPTCHA_ENABLED"] = "false"
+
+# Override settings regardless of .env or other test modules (settings may already be loaded)
+from app.core.config import settings as _app_settings
+_app_settings.RECAPTCHA_ENABLED = False
+_app_settings.EXCEPTION_WORKFLOW_SYSTEM_KEY = "test-exception-system-key"
 
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
@@ -823,39 +829,40 @@ class MinimumFlowsTestCase(unittest.TestCase):
         admin_headers = {"Authorization": f"Bearer {create_access_token({'sub': str(admin.id), 'role': admin.role})}"}
 
         _FixedDateTime.fixed_now = datetime(2026, 4, 27, 1, 0, tzinfo=timezone.utc)
-        with patch("app.api.attendance.datetime", _FixedDateTime):
+        with patch("app.api.attendance.datetime", _FixedDateTime), \
+             patch("app.api.reports.datetime", _FixedDateTime):
             checkin_res = self.client.post(
                 "/attendance/checkin",
                 headers=user_headers,
                 json={"lat": 10.7905, "lng": 106.5950},
             )
-        self.assertEqual(checkin_res.status_code, 200, checkin_res.text)
-        self.assertTrue(checkin_res.json()["log"]["is_out_of_range"])
-        self.assertEqual(checkin_res.json()["decision"], "ALLOW_WITH_EXCEPTION")
+            self.assertEqual(checkin_res.status_code, 200, checkin_res.text)
+            self.assertTrue(checkin_res.json()["log"]["is_out_of_range"])
+            self.assertEqual(checkin_res.json()["decision"], "ALLOW_WITH_EXCEPTION")
 
-        employee_exceptions_res = self.client.get(
-            "/reports/attendance-exceptions/me?status=PENDING_EMPLOYEE",
-            headers=user_headers,
-        )
-        self.assertEqual(employee_exceptions_res.status_code, 200, employee_exceptions_res.text)
-        employee_rows = [
-            row for row in employee_exceptions_res.json()
-            if row["employee_code"] == "EMGPS"
-        ]
-        self.assertEqual(len(employee_rows), 1)
-        self.assertEqual(employee_rows[0]["exception_type"], "SUSPECTED_LOCATION_SPOOF")
-        self.assertEqual(employee_rows[0]["status"], "PENDING_EMPLOYEE")
+            employee_exceptions_res = self.client.get(
+                "/reports/attendance-exceptions/me?status=PENDING_EMPLOYEE",
+                headers=user_headers,
+            )
+            self.assertEqual(employee_exceptions_res.status_code, 200, employee_exceptions_res.text)
+            employee_rows = [
+                row for row in employee_exceptions_res.json()
+                if row["employee_code"] == "EMGPS"
+            ]
+            self.assertEqual(len(employee_rows), 1)
+            self.assertEqual(employee_rows[0]["exception_type"], "SUSPECTED_LOCATION_SPOOF")
+            self.assertEqual(employee_rows[0]["status"], "PENDING_EMPLOYEE")
 
-        admin_exceptions_res = self.client.get(
-            "/reports/attendance-exceptions?from=2026-04-27&to=2026-04-27&exception_type=SUSPECTED_LOCATION_SPOOF&status=PENDING_EMPLOYEE",
-            headers=admin_headers,
-        )
-        self.assertEqual(admin_exceptions_res.status_code, 200, admin_exceptions_res.text)
-        admin_rows = [
-            row for row in admin_exceptions_res.json()
-            if row["employee_code"] == "EMGPS"
-        ]
-        self.assertEqual(len(admin_rows), 1)
+            admin_exceptions_res = self.client.get(
+                "/reports/attendance-exceptions?from=2026-04-27&to=2026-04-27&exception_type=SUSPECTED_LOCATION_SPOOF&status=PENDING_EMPLOYEE",
+                headers=admin_headers,
+            )
+            self.assertEqual(admin_exceptions_res.status_code, 200, admin_exceptions_res.text)
+            admin_rows = [
+                row for row in admin_exceptions_res.json()
+                if row["employee_code"] == "EMGPS"
+            ]
+            self.assertEqual(len(admin_rows), 1)
 
         _FixedDateTime.fixed_now = datetime(2026, 4, 27, 10, 0, tzinfo=timezone.utc)
         with patch("app.api.attendance.datetime", _FixedDateTime):
@@ -1149,7 +1156,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
         self.assertEqual(row["date"], "2026-03-10")
         self.assertEqual(row["regular_minutes"], 540)
         self.assertEqual(row["overtime_minutes"], 570)
-        self.assertEqual(row["payable_overtime_minutes"], 570)
+        self.assertEqual(row["payable_overtime_minutes"], 0)  # PENDING, not yet approved
         self.assertTrue(row["overtime_cross_day"])
 
         _FixedDateTime.fixed_now = None
@@ -1278,6 +1285,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
             json={
                 "admin_note": "Admin entered actual checkout",
                 "actual_checkout_time": "2026-03-10T10:30:00+00:00",
+                "approved_overtime_minutes": 30,
             },
         )
         self.assertEqual(approve_ok_res.status_code, 200, approve_ok_res.text)
