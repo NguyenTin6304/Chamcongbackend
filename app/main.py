@@ -18,6 +18,7 @@ from app.api.rules import router as rules_router
 from app.api.users import router as users_router
 from app.core.config import settings
 from app.core.db import Base, SessionLocal, engine
+from app.scheduler import start_reminder_scheduler, stop_reminder_scheduler
 from app.services.auth.password_reset_service import cleanup_password_reset_tokens
 
 app = FastAPI(title="Attendance API")
@@ -78,6 +79,9 @@ def startup_create_tables() -> None:
             )
             _cleanup_thread.start()
 
+    if settings.FCM_ENABLED:
+        start_reminder_scheduler()
+
 
 @app.on_event("shutdown")
 def shutdown_background_jobs() -> None:
@@ -86,6 +90,7 @@ def shutdown_background_jobs() -> None:
     if _cleanup_thread and _cleanup_thread.is_alive():
         _cleanup_thread.join(timeout=3)
     _cleanup_thread = None
+    stop_reminder_scheduler()
 
 
 @app.get("/health")

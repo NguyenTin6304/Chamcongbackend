@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from app.core.db import get_db
 from app.core.deps import require_admin
 from app.core.policy import WARN_GEOFENCE_RADIUS_M
-from app.models import Employee, Group, GroupGeofence
+from app.models import Employee, Group, GroupGeofence, Shift
 from app.schemas.groups import (
     GroupCreateRequest,
     GroupGeofenceCreateRequest,
@@ -13,6 +13,9 @@ from app.schemas.groups import (
     GroupResponse,
     GroupGeofenceUpdateRequest,
     GroupUpdateRequest,
+    ShiftCreateRequest,
+    ShiftResponse,
+    ShiftUpdateRequest,
 )
 
 router = APIRouter(prefix="/groups", tags=["groups"])
@@ -281,3 +284,129 @@ def delete_group_geofence(
     db.delete(geofence)
     db.commit()
     return {"ok": True, "deleted_id": geofence_id}
+
+
+# ─── Shift CRUD (Phase 3A) ────────────────────────────────────────────────────
+
+def _get_shift_or_404(db: Session, group_id: int, shift_id: int) -> Shift:
+    shift = (
+        db.query(Shift)
+        .filter(Shift.id == shift_id, Shift.group_id == group_id)
+        .first()
+    )
+    if not shift:
+        raise HTTPException(status_code=404, detail="Shift not found")
+    return shift
+
+
+def _clear_other_defaults(db: Session, group_id: int, keep_id: int | None) -> None:
+    """Unset is_default on all other shifts of this group.
+
+    Called before inserting/updating a shift to is_default=True. The DB also
+    has a partial unique index as a safety net, but doing it in code first
+    gives a cleaner UX (replace existing default rather than 409).
+    """
+    query = db.query(Shift).filter(
+        Shift.group_id == group_id,
+        Shift.is_default.is_(True),
+    )
+    if keep_id is not None:
+        query = query.filter(Shift.id != keep_id)
+    query.update({Shift.is_default: False}, synchronize_session=False)
+
+
+@router.get("/{group_id}/shifts", response_model=list[ShiftResponse])
+def list_group_shifts(
+    group_id: int,
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    _get_group_or_404(db, group_id)
+
+    query = db.query(Shift).filter(Shift.group_id == group_id)
+    if active_only:
+        query = query.filter(Shift.active.is_(True))
+
+    # is_default first, then by id for stable ordering.
+    return query.order_by(Shift.is_default.desc(), Shift.id.asc()).all()
+
+
+@router.post("/{group_id}/shifts", response_model=ShiftResponse)
+def create_group_shift(
+    group_id: int,
+    payload: ShiftCreateRequest,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    _get_group_or_404(db, group_id)
+
+    if payload.is_default:
+        _clear_other_defaults(db, group_id, keep_id=None)
+
+    shift = Shift(
+        group_id=group_id,
+        name=payload.name,
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+        is_default=payload.is_default,
+        active=payload.active,
+    )
+
+    try:
+        db.add(shift)
+        db.commit()
+        db.refresh(shift)
+        return shift
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Failed to create shift")
+
+
+@router.put("/{group_id}/shifts/{shift_id}", response_model=ShiftResponse)
+def update_group_shift(
+    group_id: int,
+    shift_id: int,
+    payload: ShiftUpdateRequest,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    shift = _get_shift_or_404(db, group_id, shift_id)
+
+    fields_set = payload.model_fields_set
+
+    # If switching to default, unset other defaults first.
+    if "is_default" in fields_set and payload.is_default is True:
+        _clear_other_defaults(db, group_id, keep_id=shift_id)
+
+    if "name" in fields_set and payload.name is not None:
+        shift.name = payload.name
+    if "start_time" in fields_set and payload.start_time is not None:
+        shift.start_time = payload.start_time
+    if "end_time" in fields_set and payload.end_time is not None:
+        shift.end_time = payload.end_time
+    if "is_default" in fields_set and payload.is_default is not None:
+        shift.is_default = payload.is_default
+    if "active" in fields_set and payload.active is not None:
+        shift.active = payload.active
+
+    try:
+        db.commit()
+        db.refresh(shift)
+        return shift
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Failed to update shift")
+
+
+@router.delete("/{group_id}/shifts/{shift_id}")
+def delete_group_shift(
+    group_id: int,
+    shift_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    shift = _get_shift_or_404(db, group_id, shift_id)
+    db.delete(shift)
+    db.commit()
+    return {"ok": True, "deleted_id": shift_id}
