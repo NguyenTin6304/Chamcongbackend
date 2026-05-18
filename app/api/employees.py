@@ -6,12 +6,14 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_admin
-from app.models import AttendanceLog, CheckinRule, Employee, Group, User
+from app.models import AttendanceLog, CheckinRule, Employee, EmployeeShiftOverride, Group, Shift, User
 from app.schemas.employees import (
     EmployeeAssignGroupRequest,
     EmployeeAssignUserRequest,
     EmployeeCreateRequest,
     EmployeeResponse,
+    EmployeeShiftOverrideResponse,
+    EmployeeShiftOverrideUpsertRequest,
     EmployeeUpdateRequest,
 )
 
@@ -292,3 +294,134 @@ def restore_employee(
     db.commit()
     db.refresh(emp)
     return emp
+
+
+# ─── Shift override (Phase 3B) ────────────────────────────────────────────────
+
+
+def _override_to_response(
+    override: EmployeeShiftOverride, shift: Shift
+) -> EmployeeShiftOverrideResponse:
+    return EmployeeShiftOverrideResponse(
+        id=override.id,
+        employee_id=override.employee_id,
+        shift_id=override.shift_id,
+        shift_name=shift.name,
+        shift_start_time=shift.start_time,
+        shift_end_time=shift.end_time,
+        effective_date=override.effective_date,
+        end_date=override.end_date,
+    )
+
+
+def _get_active_employee_or_404(db: Session, employee_id: int) -> Employee:
+    emp = (
+        db.query(Employee)
+        .filter(Employee.id == employee_id, Employee.deleted_at.is_(None))
+        .first()
+    )
+    if not emp:
+        raise HTTPException(status_code=404, detail="Không tìm thấy nhân viên")
+    return emp
+
+
+@router.get(
+    "/{employee_id}/shift-override",
+    response_model=EmployeeShiftOverrideResponse | None,
+)
+def get_employee_shift_override(
+    employee_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    _get_active_employee_or_404(db, employee_id)
+
+    override = (
+        db.query(EmployeeShiftOverride)
+        .filter(EmployeeShiftOverride.employee_id == employee_id)
+        .first()
+    )
+    if override is None:
+        return None
+
+    shift = db.query(Shift).filter(Shift.id == override.shift_id).first()
+    if shift is None:
+        # Orphan override (shift was deleted) — clean up silently.
+        db.delete(override)
+        db.commit()
+        return None
+
+    return _override_to_response(override, shift)
+
+
+@router.put(
+    "/{employee_id}/shift-override",
+    response_model=EmployeeShiftOverrideResponse,
+)
+def upsert_employee_shift_override(
+    employee_id: int,
+    payload: EmployeeShiftOverrideUpsertRequest,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    emp = _get_active_employee_or_404(db, employee_id)
+
+    shift = db.query(Shift).filter(Shift.id == payload.shift_id).first()
+    if shift is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy ca làm việc")
+
+    # Shift must belong to the same group as the employee. Without this guard
+    # an admin could assign "Ca chiều của nhóm B" to an employee in nhóm A,
+    # which would silently break geofence assumptions downstream.
+    if emp.group_id is None or shift.group_id != emp.group_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Ca làm việc phải thuộc cùng nhóm với nhân viên",
+        )
+
+    if not shift.active:
+        raise HTTPException(status_code=400, detail="Ca làm việc đã ngừng hoạt động")
+
+    override = (
+        db.query(EmployeeShiftOverride)
+        .filter(EmployeeShiftOverride.employee_id == employee_id)
+        .first()
+    )
+    if override is None:
+        override = EmployeeShiftOverride(
+            employee_id=employee_id,
+            shift_id=payload.shift_id,
+            effective_date=payload.effective_date,
+            end_date=payload.end_date,
+        )
+        db.add(override)
+    else:
+        override.shift_id = payload.shift_id
+        override.effective_date = payload.effective_date
+        override.end_date = payload.end_date
+
+    db.commit()
+    db.refresh(override)
+    return _override_to_response(override, shift)
+
+
+@router.delete(
+    "/{employee_id}/shift-override",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_employee_shift_override(
+    employee_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_admin),
+):
+    _get_active_employee_or_404(db, employee_id)
+
+    override = (
+        db.query(EmployeeShiftOverride)
+        .filter(EmployeeShiftOverride.employee_id == employee_id)
+        .first()
+    )
+    if override is None:
+        return
+    db.delete(override)
+    db.commit()

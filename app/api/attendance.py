@@ -11,8 +11,8 @@ from sqlalchemy.orm import Session, aliased
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_admin
-from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, ExceptionPolicy, Group, GroupGeofence, LeaveRequest, OvertimeRecord, PublicHoliday, User
-from app.schemas.attendance import AttendanceDailyReportResponse, AttendanceLogResponse, AttendanceStatusResponse, CheckActionResponse, LocationRequest, MyMonthlyStatsResponse
+from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, EmployeeShiftOverride, ExceptionPolicy, Group, GroupGeofence, LeaveRequest, OvertimeRecord, PublicHoliday, Shift, User
+from app.schemas.attendance import AttendanceDailyReportResponse, AttendanceLogResponse, AttendanceStatusResponse, CheckActionResponse, LocationRequest, MyMonthlyStatsResponse, MyShiftResponse
 from app.services.attendance_time import (
     DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
     VN_TZ,
@@ -66,6 +66,10 @@ class _EffectiveTimeRule(NamedTuple):
     cutoff_minutes: int
     source: str
     fallback_reason: str | None
+    # Phase 3C: name of the resolved Shift if source is GROUP_SHIFT /
+    # EMPLOYEE_SHIFT_OVERRIDE; None for legacy GROUP / SYSTEM_FALLBACK sources
+    # that don't have a named shift attached.
+    shift_name: str | None = None
 
 
 def _find_employee_for_user(db: Session, user: User) -> Employee | None:
@@ -158,6 +162,82 @@ def _get_effective_time_rule(db: Session, emp: Employee, fallback_rule: CheckinR
     if emp.group_id is not None:
         group = db.query(Group).filter(Group.id == emp.group_id).first()
         if group and group.active:
+            # Phase 3B: per-employee override has highest priority. Active when
+            # effective_date <= today_vn AND (end_date IS NULL OR end_date >= today_vn).
+            # Outside that window the override row exists but is ignored — we
+            # fall through to the group default Shift / Group.end_time chain.
+            today_vn = datetime.now(VN_TZ).date()
+            override_shift = (
+                db.query(Shift)
+                .join(
+                    EmployeeShiftOverride,
+                    EmployeeShiftOverride.shift_id == Shift.id,
+                )
+                .filter(
+                    EmployeeShiftOverride.employee_id == emp.id,
+                    EmployeeShiftOverride.effective_date <= today_vn,
+                    (EmployeeShiftOverride.end_date.is_(None))
+                    | (EmployeeShiftOverride.end_date >= today_vn),
+                    Shift.active.is_(True),
+                    # The override must point to a shift in the employee's
+                    # group — defensive check in case group changed after
+                    # override was set.
+                    Shift.group_id == group.id,
+                )
+                .first()
+            )
+            if override_shift:
+                return _EffectiveTimeRule(
+                    start_time=override_shift.start_time,
+                    grace_minutes=group.grace_minutes if group.grace_minutes is not None else fallback_rule.grace_minutes,
+                    end_time=override_shift.end_time,
+                    checkout_grace_minutes=(
+                        group.checkout_grace_minutes
+                        if group.checkout_grace_minutes is not None
+                        else fallback_rule.checkout_grace_minutes
+                    ),
+                    cutoff_minutes=(
+                        group.cross_day_cutoff_minutes
+                        if group.cross_day_cutoff_minutes is not None
+                        else system_cutoff_minutes
+                    ),
+                    source='EMPLOYEE_SHIFT_OVERRIDE',
+                    fallback_reason=None,
+                    shift_name=override_shift.name,
+                )
+
+            # Phase 3A: if group has a default Shift, use its start/end times.
+            # Grace/cutoff settings still come from group (or system fallback) —
+            # Shift only owns the shift window.
+            default_shift = (
+                db.query(Shift)
+                .filter(
+                    Shift.group_id == group.id,
+                    Shift.is_default.is_(True),
+                    Shift.active.is_(True),
+                )
+                .first()
+            )
+            if default_shift:
+                return _EffectiveTimeRule(
+                    start_time=default_shift.start_time,
+                    grace_minutes=group.grace_minutes if group.grace_minutes is not None else fallback_rule.grace_minutes,
+                    end_time=default_shift.end_time,
+                    checkout_grace_minutes=(
+                        group.checkout_grace_minutes
+                        if group.checkout_grace_minutes is not None
+                        else fallback_rule.checkout_grace_minutes
+                    ),
+                    cutoff_minutes=(
+                        group.cross_day_cutoff_minutes
+                        if group.cross_day_cutoff_minutes is not None
+                        else system_cutoff_minutes
+                    ),
+                    source='GROUP_SHIFT',
+                    fallback_reason=None,
+                    shift_name=default_shift.name,
+                )
+
             return _EffectiveTimeRule(
                 start_time=group.start_time or fallback_rule.start_time,
                 grace_minutes=group.grace_minutes if group.grace_minutes is not None else fallback_rule.grace_minutes,
@@ -1544,6 +1624,27 @@ def my_logs(
 
     logs = q.order_by(AttendanceLog.time.desc()).all()
     return [_to_log_response(x) for x in logs]
+
+
+@router.get("/me/shift", response_model=MyShiftResponse)
+def my_resolved_shift(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Phase 3C — return the shift currently in effect for the caller.
+
+    Mirrors the same resolve chain used at checkin time so the home screen
+    always shows the right window before the user actually checks in.
+    """
+    emp = _get_employee_for_user(db, user)
+    active_rule = _get_active_rule(db)
+    rule = _get_effective_time_rule(db, emp, active_rule)
+    return MyShiftResponse(
+        shift_name=rule.shift_name,
+        start_time=rule.start_time.strftime("%H:%M"),
+        end_time=rule.end_time.strftime("%H:%M"),
+        source=rule.source,
+    )
 
 
 @router.get("/me/stats", response_model=MyMonthlyStatsResponse)

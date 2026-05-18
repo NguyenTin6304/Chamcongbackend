@@ -89,6 +89,24 @@ class AttendanceStatusResponse(BaseModel):
     warning_date: date | None = None
 
 
+class MyShiftResponse(BaseModel):
+    """Phase 3C — resolved shift for the calling employee, today.
+
+    `shift_name` is None when the resolved source has no named Shift (legacy
+    `GROUP` config or `SYSTEM_FALLBACK`). The client should fall back to
+    rendering just the time range in that case.
+    """
+    shift_name: str | None = None
+    start_time: str  # "HH:MM"
+    end_time: str  # "HH:MM"
+    source: Literal[
+        "EMPLOYEE_SHIFT_OVERRIDE",
+        "GROUP_SHIFT",
+        "GROUP",
+        "SYSTEM_FALLBACK",
+    ]
+
+
 class AttendanceDailyReportResponse(BaseModel):
     date: date
     employee_code: str

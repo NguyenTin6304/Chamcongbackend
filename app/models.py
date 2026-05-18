@@ -75,6 +75,59 @@ class GroupGeofence(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class Shift(Base):
+    """Named shift belonging to a group (Phase 3A — Shift Management).
+
+    Each group may have multiple shifts (e.g. Ca sáng / Ca chiều). Exactly one
+    shift per group may be marked is_default — enforced by a partial unique
+    index in the migration. Resolution order at checkin time:
+        EmployeeShiftOverride (Phase 3B) > Group default Shift > Group.end_time > CheckinRule
+    """
+    __tablename__ = "shifts"
+
+    id = Column(Integer, primary_key=True)
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    start_time = Column(Time, nullable=False)
+    end_time = Column(Time, nullable=False)
+    is_default = Column(Boolean, nullable=False, default=False, server_default="false")
+    active = Column(Boolean, nullable=False, default=True, server_default="true")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class EmployeeShiftOverride(Base):
+    """Per-employee shift override (Phase 3B).
+
+    A single override row per employee (UNIQUE on employee_id) — PUT replaces,
+    DELETE clears. Active only when effective_date <= today AND (end_date IS
+    NULL OR end_date >= today). Outside that window, resolution falls back to
+    the group's default Shift / Group.end_time / CheckinRule.
+
+    The single-row design keeps overlap validation trivial: there is no overlap
+    case to consider. If future use requires history or future-dated swaps,
+    relax the UNIQUE constraint and add range validation in a later phase.
+    """
+    __tablename__ = "employee_shift_overrides"
+
+    id = Column(Integer, primary_key=True)
+    employee_id = Column(
+        Integer,
+        ForeignKey("employees.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    shift_id = Column(Integer, ForeignKey("shifts.id"), nullable=False)
+    effective_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class Employee(Base):
     __tablename__ = "employees"
 

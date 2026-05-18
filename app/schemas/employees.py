@@ -1,8 +1,8 @@
-from datetime import datetime
+from datetime import date, datetime, time
 import re
 from typing import Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator
 
 
 def _normalize_phone(value: Optional[str]) -> Optional[str]:
@@ -64,6 +64,47 @@ class EmployeeResponse(BaseModel):
     annual_leave_days: Optional[float] = None
     resigned_at: Optional[datetime] = None
     joined_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Shift override (Phase 3B) ────────────────────────────────────────────────
+
+
+class EmployeeShiftOverrideUpsertRequest(BaseModel):
+    shift_id: int = Field(gt=0)
+    effective_date: date
+    end_date: Optional[date] = None
+
+    @field_validator("end_date")
+    @classmethod
+    def validate_end_after_effective(cls, value: Optional[date], info) -> Optional[date]:
+        if value is None:
+            return value
+        effective = info.data.get("effective_date")
+        if effective is not None and value < effective:
+            raise ValueError("end_date phải >= effective_date")
+        return value
+
+
+class EmployeeShiftOverrideResponse(BaseModel):
+    id: int
+    employee_id: int
+    shift_id: int
+    shift_name: str
+    shift_start_time: time
+    shift_end_time: time
+    effective_date: date
+    end_date: Optional[date] = None
+
+    @field_serializer("shift_start_time")
+    def _ser_start(self, value: time) -> str:
+        return value.strftime("%H:%M")
+
+    @field_serializer("shift_end_time")
+    def _ser_end(self, value: time) -> str:
+        return value.strftime("%H:%M")
 
     class Config:
         from_attributes = True
