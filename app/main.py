@@ -65,6 +65,17 @@ def _password_reset_cleanup_loop() -> None:
 
 @app.on_event("startup")
 def startup_create_tables() -> None:
+    # Run pending Alembic migrations automatically on every startup.
+    # Safe to run repeatedly — Alembic is idempotent (skips already-applied migrations).
+    try:
+        from alembic.config import Config
+        from alembic import command as alembic_command
+        alembic_cfg = Config("alembic.ini")
+        alembic_command.upgrade(alembic_cfg, "head")
+        logger.info("Alembic migrations applied successfully")
+    except Exception:
+        logger.exception("Alembic migration failed — continuing startup anyway")
+
     # Keep Alembic as source of truth. Enable only for quick local demos.
     if settings.AUTO_CREATE_TABLES:
         Base.metadata.create_all(bind=engine)
