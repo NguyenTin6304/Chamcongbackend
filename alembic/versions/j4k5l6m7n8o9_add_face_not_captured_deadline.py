@@ -17,9 +17,13 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column('exception_policies', sa.Column(
-        'face_not_captured_deadline_hours', sa.Integer(), nullable=True
-    ))
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    cols = [c["name"] for c in inspector.get_columns("exception_policies")]
+    if "face_not_captured_deadline_hours" not in cols:
+        op.add_column('exception_policies', sa.Column(
+            'face_not_captured_deadline_hours', sa.Integer(), nullable=True
+        ))
 
 
 def downgrade() -> None:
