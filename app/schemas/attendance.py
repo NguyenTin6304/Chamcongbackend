@@ -9,7 +9,13 @@ CheckoutStatus = Literal["EARLY", "ON_TIME", "LATE", "NO_CHECKOUT", "SYSTEM_AUTO
 AttendanceState = Literal["COMPLETE", "MISSED_CHECKOUT", "MISSING_CHECKIN_ANOMALY", "ABSENT", "PENDING_TIMESHEET"]
 GeofenceSource = Literal["GROUP", "SYSTEM_FALLBACK"]
 TimeRuleSource = Literal["GROUP", "SYSTEM_FALLBACK"]
-AttendanceExceptionType = Literal["MISSED_CHECKOUT", "AUTO_CLOSED", "SUSPECTED_LOCATION_SPOOF", "LARGE_TIME_DEVIATION"]
+AttendanceExceptionType = Literal[
+    "MISSED_CHECKOUT",
+    "AUTO_CLOSED",
+    "SUSPECTED_LOCATION_SPOOF",
+    "LARGE_TIME_DEVIATION",
+    "FACE_NOT_CAPTURED",   # Phase 4.1: web device có no camera
+]
 AttendanceExceptionStatus = Literal[
     "PENDING_EMPLOYEE",
     "PENDING_ADMIN",
@@ -87,6 +93,9 @@ class AttendanceStatusResponse(BaseModel):
     message: str
     warning_code: Literal["MISSED_CHECKOUT", "AUTO_CLOSED"] | None = None
     warning_date: date | None = None
+    # Phase 4.1: log_id of today's most-recent log whose face has not been captured yet.
+    # Non-null → client must show FaceCaptureDialog (handles page-refresh bypass).
+    pending_face_log_id: int | None = None
 
 
 class MyShiftResponse(BaseModel):

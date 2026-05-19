@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from app.api.attendance import router as attendance_router
 from app.api.auth import router as auth_router
 from app.api.employees import router as employees_router
+from app.api.face import router as face_router
 from app.api.geofences import router as geofences_router
 from app.api.groups import router as groups_router
 from app.api.leave import router as leave_router
@@ -176,3 +177,4 @@ app.include_router(reports_router)
 app.include_router(rules_router)
 app.include_router(auth_router)
 app.include_router(users_router)
+app.include_router(face_router, prefix="/face", tags=["face"])
