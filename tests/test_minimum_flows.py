@@ -28,7 +28,7 @@ from app.core.db import Base, SessionLocal, engine
 from app.core.security import create_access_token, hash_password, hash_token
 from app.main import app
 from app.api import attendance as attendance_api
-from app.models import AttendanceException, AttendanceExceptionAudit, AttendanceExceptionNotification, AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, LeaveRequest, PasswordResetToken, PublicHoliday, RefreshToken, User
+from app.models import AttendanceException, AttendanceExceptionAudit, AttendanceExceptionNotification, AttendanceLog, CheckinRule, Employee, EmployeeShiftOverride, Group, GroupGeofence, LeaveRequest, OvertimeAudit, OvertimeRecord, PasswordResetToken, PublicHoliday, RefreshToken, Shift, User
 from app.schemas.attendance import LocationRequest
 from app.services.auth.password_reset_service import PasswordResetService, cleanup_password_reset_tokens
 from app.services.attendance_exception_jobs import expire_overdue_exceptions, send_expire_reminders
@@ -97,6 +97,9 @@ class MinimumFlowsTestCase(unittest.TestCase):
             db.query(AttendanceExceptionNotification).delete()
             db.query(AttendanceExceptionAudit).delete()
             db.query(AttendanceException).delete()
+            db.query(OvertimeAudit).delete()
+            db.query(OvertimeRecord).delete()
+            db.query(EmployeeShiftOverride).delete()
             db.query(AttendanceLog).delete()
             db.query(LeaveRequest).delete()
             db.query(PublicHoliday).delete()
@@ -104,6 +107,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
             db.query(PasswordResetToken).delete()
             db.query(Employee).delete()
             db.query(GroupGeofence).delete()
+            db.query(Shift).delete()
             db.query(Group).delete()
             db.query(CheckinRule).delete()
             db.query(User).delete()
