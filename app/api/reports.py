@@ -221,6 +221,21 @@ def _fetch_daily_report_rows(
         case((AttendanceLog.type == "OUT", AttendanceLog.lng), else_=None)
     ).label("checkout_lng")
 
+    # Phase 4.1 — face capture fields per side (max() is safe because of
+    # UniqueConstraint(employee_id, work_date, type) — at most 1 IN and 1 OUT.
+    checkin_log_id_expr = func.max(
+        case((AttendanceLog.type == "IN", AttendanceLog.id), else_=None)
+    ).label("checkin_log_id")
+    checkout_log_id_expr = func.max(
+        case((AttendanceLog.type == "OUT", AttendanceLog.id), else_=None)
+    ).label("checkout_log_id")
+    checkin_face_status_expr = func.max(
+        case((AttendanceLog.type == "IN", AttendanceLog.face_check_status), else_=None)
+    ).label("checkin_face_status")
+    checkout_face_status_expr = func.max(
+        case((AttendanceLog.type == "OUT", AttendanceLog.face_check_status), else_=None)
+    ).label("checkout_face_status")
+
     q = (
         db.query(
             work_date_expr.label("work_date"),
@@ -247,6 +262,10 @@ def _fetch_daily_report_rows(
             checkin_lng_expr,
             checkout_lat_expr,
             checkout_lng_expr,
+            checkin_log_id_expr,
+            checkout_log_id_expr,
+            checkin_face_status_expr,
+            checkout_face_status_expr,
         )
         .join(Employee, Employee.id == AttendanceLog.employee_id)
         .outerjoin(Group, Group.id == Employee.group_id)
@@ -936,6 +955,10 @@ def list_attendance_logs_for_dashboard(
             "checkin_lng": float(row.checkin_lng) if row.checkin_lng is not None else None,
             "checkout_lat": float(row.checkout_lat) if row.checkout_lat is not None else None,
             "checkout_lng": float(row.checkout_lng) if row.checkout_lng is not None else None,
+            "checkin_log_id": int(row.checkin_log_id) if row.checkin_log_id is not None else None,
+            "checkout_log_id": int(row.checkout_log_id) if row.checkout_log_id is not None else None,
+            "checkin_face_status": row.checkin_face_status,
+            "checkout_face_status": row.checkout_face_status,
         })
 
     # Sort
@@ -1442,10 +1465,17 @@ def list_attendance_exceptions(
     normalized_exception_type = exception_type.strip().upper()
     if normalized_exception_type == "GPS_RISK":
         normalized_exception_type = "SUSPECTED_LOCATION_SPOOF"
-    if normalized_exception_type not in {"MISSED_CHECKOUT", "AUTO_CLOSED", "SUSPECTED_LOCATION_SPOOF", "LARGE_TIME_DEVIATION"}:
+    _allowed_exception_types = {
+        "MISSED_CHECKOUT",
+        "AUTO_CLOSED",
+        "SUSPECTED_LOCATION_SPOOF",
+        "LARGE_TIME_DEVIATION",
+        "FACE_NOT_CAPTURED",  # Phase 4.1
+    }
+    if normalized_exception_type not in _allowed_exception_types:
         raise HTTPException(
             status_code=400,
-            detail="exception_type must be MISSED_CHECKOUT, AUTO_CLOSED, SUSPECTED_LOCATION_SPOOF or LARGE_TIME_DEVIATION",
+            detail=f"exception_type must be one of: {', '.join(sorted(_allowed_exception_types))}",
         )
 
     normalized_status = status_filter.strip().upper() if status_filter else None

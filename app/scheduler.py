@@ -6,11 +6,15 @@ password-reset cleanup in main.py — no APScheduler dependency needed.
 Jobs:
   - send_checkout_reminders: every 5 minutes, find checked-in-but-not-checked-out
     employees within the reminder window and fire FCM push notifications.
+  - cleanup_old_face_images: daily at 02:00 VN, delete face images older than
+    FACE_RETENTION_DAYS (default 30 days).
 """
 
 import logging
+import shutil
 import threading
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 from app.core.config import settings
 
@@ -128,12 +132,59 @@ def send_checkout_reminders() -> None:
         logger.info("checkout_reminder: %s reminder(s) sent for %s", sent_count, today)
 
 
+def cleanup_old_face_images() -> None:
+    """Delete face image directories older than FACE_RETENTION_DAYS.
+
+    Directory layout: <FACE_UPLOAD_DIR>/<YYYY-MM-DD>/<employee_id>/...
+    We iterate the date-level directories and remove those whose date
+    is older than the retention cutoff.
+    """
+    base_dir = Path(settings.FACE_UPLOAD_DIR)
+    if not base_dir.exists():
+        return
+
+    cutoff_date = datetime.now(timezone.utc).date() - timedelta(days=settings.FACE_RETENTION_DAYS)
+    removed = 0
+    for date_dir in base_dir.iterdir():
+        if not date_dir.is_dir():
+            continue
+        try:
+            dir_date = date.fromisoformat(date_dir.name)
+        except ValueError:
+            continue
+        if dir_date < cutoff_date:
+            try:
+                shutil.rmtree(date_dir)
+                removed += 1
+                logger.info("face_cleanup: removed %s", date_dir)
+            except OSError:
+                logger.exception("face_cleanup: failed to remove %s", date_dir)
+
+    if removed:
+        logger.info("face_cleanup: removed %s date directories (cutoff %s)", removed, cutoff_date)
+
+
+# Track last cleanup date to run at most once per calendar day.
+_last_cleanup_date: date | None = None
+
+
 def _reminder_loop() -> None:
+    global _last_cleanup_date
     while not _stop_event.is_set():
         try:
             send_checkout_reminders()
         except Exception:
             logger.exception("checkout_reminder: unhandled error in loop")
+
+        # Run face cleanup once per day around 02:00 VN
+        try:
+            now_vn = _now_vn()
+            today_vn = now_vn.date()
+            if now_vn.hour == 2 and _last_cleanup_date != today_vn:
+                _last_cleanup_date = today_vn
+                cleanup_old_face_images()
+        except Exception:
+            logger.exception("face_cleanup: unhandled error in loop")
 
         if _stop_event.wait(POLL_INTERVAL_SECONDS):
             break

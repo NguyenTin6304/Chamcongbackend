@@ -10,6 +10,7 @@ class ExceptionPolicyResponse(BaseModel):
     missed_checkout_deadline_hours: Optional[int] = None
     location_risk_deadline_hours: Optional[int] = None
     large_time_deviation_deadline_hours: Optional[int] = None
+    face_not_captured_deadline_hours: Optional[int] = None
     grace_period_days: int
     updated_at: Optional[datetime] = None
     updated_by_name: Optional[str] = None
@@ -23,6 +24,7 @@ class ExceptionPolicyPatch(BaseModel):
     missed_checkout_deadline_hours: Optional[int] = Field(default=None, ge=1, le=8760)
     location_risk_deadline_hours: Optional[int] = Field(default=None, ge=1, le=8760)
     large_time_deviation_deadline_hours: Optional[int] = Field(default=None, ge=1, le=8760)
+    face_not_captured_deadline_hours: Optional[int] = Field(default=None, ge=1, le=8760)
     grace_period_days: Optional[int] = Field(default=None, ge=1, le=3650)  # max 10 years
     # Sentinel: passing null explicitly clears the override for that type
     # Use Field with special sentinel to distinguish "not provided" from "set to null"

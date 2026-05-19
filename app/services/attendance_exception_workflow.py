@@ -150,6 +150,8 @@ def get_deadline_hours(policy: "ExceptionPolicy", exception_type: str) -> int:
         per_type = policy.location_risk_deadline_hours
     elif normalized == "LARGE_TIME_DEVIATION":
         per_type = policy.large_time_deviation_deadline_hours
+    elif normalized == "FACE_NOT_CAPTURED":
+        per_type = policy.face_not_captured_deadline_hours
     return per_type if per_type is not None else policy.default_deadline_hours
 
 

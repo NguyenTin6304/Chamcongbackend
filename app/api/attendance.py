@@ -1052,6 +1052,26 @@ def _apply_exception_to_attendance_state(
     return attendance_state
 
 
+def _get_pending_face_log_id(db: Session, employee_id: int, work_date) -> int | None:
+    """Return the most-recent log for work_date whose face has not been captured yet.
+
+    face_check_status IS NULL means the upload dialog was never completed
+    (e.g. employee refreshed the page right after checkin/checkout).
+    QUALITY_LOW / NOT_CAPTURED are terminal states — no retry needed.
+    """
+    log = (
+        db.query(AttendanceLog)
+        .filter(
+            AttendanceLog.employee_id == employee_id,
+            AttendanceLog.work_date == work_date,
+            AttendanceLog.face_check_status.is_(None),
+        )
+        .order_by(AttendanceLog.time.desc())
+        .first()
+    )
+    return log.id if log else None
+
+
 @router.get("/status", response_model=AttendanceStatusResponse)
 def my_attendance_status(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     emp = _find_employee_for_user(db, user)
@@ -1122,6 +1142,7 @@ def my_attendance_status(db: Session = Depends(get_db), user: User = Depends(get
                 message=message,
                 warning_code="MISSED_CHECKOUT" if missed_work_date is not None else None,
                 warning_date=missed_work_date,
+                pending_face_log_id=_get_pending_face_log_id(db, emp.id, open_work_date),
             )
 
     active_rule = _get_active_rule(db)
@@ -1143,6 +1164,7 @@ def my_attendance_status(db: Session = Depends(get_db), user: User = Depends(get
             message="Ban da hoan thanh phien lam viec cho ngay cong hien tai.",
             warning_code="AUTO_CLOSED" if auto_closed_work_date else None,
             warning_date=auto_closed_work_date,
+            pending_face_log_id=_get_pending_face_log_id(db, emp.id, current_work_date),
         )
 
     return AttendanceStatusResponse(

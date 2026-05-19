@@ -190,6 +190,7 @@ def _policy_to_response(policy: ExceptionPolicy, db: Session) -> ExceptionPolicy
         missed_checkout_deadline_hours=policy.missed_checkout_deadline_hours,
         location_risk_deadline_hours=policy.location_risk_deadline_hours,
         large_time_deviation_deadline_hours=policy.large_time_deviation_deadline_hours,
+        face_not_captured_deadline_hours=policy.face_not_captured_deadline_hours,
         grace_period_days=policy.grace_period_days,
         updated_at=policy.updated_at,
         updated_by_name=updated_by_name,
@@ -224,6 +225,8 @@ def patch_exception_policy(
         policy.location_risk_deadline_hours = payload.location_risk_deadline_hours
     if "large_time_deviation_deadline_hours" in provided:
         policy.large_time_deviation_deadline_hours = payload.large_time_deviation_deadline_hours
+    if "face_not_captured_deadline_hours" in provided:
+        policy.face_not_captured_deadline_hours = payload.face_not_captured_deadline_hours
     if "grace_period_days" in provided and payload.grace_period_days is not None:
         policy.grace_period_days = payload.grace_period_days
 

@@ -223,6 +223,11 @@ class AttendanceLog(Base):
 
     address_text = Column(Text, nullable=True)
 
+    # Phase 4.1 — face capture
+    face_image_path = Column(String(500), nullable=True)
+    face_check_status = Column(String(30), nullable=True)  # CAPTURED | QUALITY_LOW | NOT_CAPTURED | SKIPPED
+    face_captured_at = Column(DateTime(timezone=True), nullable=True)
+
 
 class AttendanceException(Base):
     __tablename__ = "attendance_exceptions"
@@ -274,6 +279,7 @@ class ExceptionPolicy(Base):
     missed_checkout_deadline_hours = Column(Integer, nullable=True)
     location_risk_deadline_hours = Column(Integer, nullable=True)
     large_time_deviation_deadline_hours = Column(Integer, nullable=True)
+    face_not_captured_deadline_hours = Column(Integer, nullable=True)
     grace_period_days = Column(Integer, nullable=False, default=30)
     updated_at = Column(DateTime(timezone=True), nullable=True)
     updated_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)

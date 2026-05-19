@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     # Absolute path to the Firebase service account JSON file.
     FCM_SERVICE_ACCOUNT_PATH: str = ""
 
+    # Phase 4.1 — face capture storage
+    FACE_UPLOAD_DIR: str = "uploads/face"
+    FACE_RETENTION_DAYS: int = 30
+
 
 settings = Settings()
 
