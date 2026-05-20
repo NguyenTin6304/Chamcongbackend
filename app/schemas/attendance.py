@@ -8,7 +8,7 @@ CheckinStatus = Literal["EARLY", "ON_TIME", "LATE", "NO_CHECKIN"]
 CheckoutStatus = Literal["EARLY", "ON_TIME", "LATE", "NO_CHECKOUT", "SYSTEM_AUTO", "MISSING_PUNCH"]
 AttendanceState = Literal["COMPLETE", "MISSED_CHECKOUT", "MISSING_CHECKIN_ANOMALY", "ABSENT", "PENDING_TIMESHEET"]
 GeofenceSource = Literal["GROUP", "SYSTEM_FALLBACK"]
-TimeRuleSource = Literal["GROUP", "SYSTEM_FALLBACK"]
+TimeRuleSource = Literal["EMPLOYEE_SHIFT_OVERRIDE", "GROUP_SHIFT", "GROUP", "SYSTEM_FALLBACK"]
 AttendanceExceptionType = Literal[
     "MISSED_CHECKOUT",
     "AUTO_CLOSED",
