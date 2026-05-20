@@ -91,8 +91,9 @@ def startup_create_tables() -> None:
             )
             _cleanup_thread.start()
 
-    if settings.FCM_ENABLED:
-        start_reminder_scheduler()
+    # Always start the scheduler — it handles both FCM checkout reminders
+    # (skipped internally when FCM_ENABLED=False) and face image cleanup.
+    start_reminder_scheduler()
 
 
 @app.on_event("shutdown")

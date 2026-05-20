@@ -176,11 +176,14 @@ def _reminder_loop() -> None:
         except Exception:
             logger.exception("checkout_reminder: unhandled error in loop")
 
-        # Run face cleanup once per day around 02:00 VN
+        # Run face cleanup once per calendar day (VN time).
+        # Triggers at 02:00 or on the first loop tick after server restarts
+        # past 02:00 so the cleanup is never skipped on restarts.
         try:
             now_vn = _now_vn()
             today_vn = now_vn.date()
-            if now_vn.hour == 2 and _last_cleanup_date != today_vn:
+            due = now_vn.hour >= 2 and _last_cleanup_date != today_vn
+            if due:
                 _last_cleanup_date = today_vn
                 cleanup_old_face_images()
         except Exception:
