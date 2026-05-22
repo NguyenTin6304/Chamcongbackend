@@ -4,6 +4,7 @@ import threading
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.attendance import router as attendance_router
@@ -42,6 +43,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Compress JSON/text responses ≥ 1KB. Skips already-compressed payloads
+# (images, files) automatically. Browsers/HTTP clients negotiate via
+# Accept-Encoding header — clients without gzip support get raw response.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 def _password_reset_cleanup_loop() -> None:
