@@ -141,3 +141,73 @@ class GroupGeofenceResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+def _normalize_time(value):
+    if value is None or isinstance(value, time):
+        return value
+    if isinstance(value, str):
+        raw = value.strip()
+        try:
+            return time.fromisoformat(raw)
+        except ValueError:
+            if len(raw) == 5:
+                return time.fromisoformat(f"{raw}:00")
+    return value
+
+
+class ShiftCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    start_time: time
+    end_time: time
+    is_default: bool = False
+    active: bool = True
+
+    @field_validator("start_time", mode="before")
+    @classmethod
+    def _norm_start(cls, v):
+        return _normalize_time(v)
+
+    @field_validator("end_time", mode="before")
+    @classmethod
+    def _norm_end(cls, v):
+        return _normalize_time(v)
+
+
+class ShiftUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    start_time: time | None = None
+    end_time: time | None = None
+    is_default: bool | None = None
+    active: bool | None = None
+
+    @field_validator("start_time", mode="before")
+    @classmethod
+    def _norm_start(cls, v):
+        return _normalize_time(v)
+
+    @field_validator("end_time", mode="before")
+    @classmethod
+    def _norm_end(cls, v):
+        return _normalize_time(v)
+
+
+class ShiftResponse(BaseModel):
+    id: int
+    group_id: int
+    name: str
+    start_time: time
+    end_time: time
+    is_default: bool
+    active: bool
+
+    @field_serializer("start_time")
+    def _ser_start(self, value: time) -> str:
+        return value.strftime("%H:%M")
+
+    @field_serializer("end_time")
+    def _ser_end(self, value: time) -> str:
+        return value.strftime("%H:%M")
+
+    class Config:
+        from_attributes = True

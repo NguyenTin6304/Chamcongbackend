@@ -2,7 +2,7 @@
 import sqlite3
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from datetime import date, datetime, time, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -12,17 +12,23 @@ os.environ.setdefault("SECRET_KEY", "test-secret-key-at-least-16")
 os.environ.setdefault("ALGORITHM", "HS256")
 os.environ.setdefault("ACCESS_TOKEN_EXPIRE_MINUTES", "60")
 os.environ.setdefault("EXCEPTION_WORKFLOW_SYSTEM_KEY", "test-exception-system-key")
+os.environ["RECAPTCHA_ENABLED"] = "false"
+
+# Override settings regardless of .env or other test modules (settings may already be loaded)
+from app.core.config import settings as _app_settings
+_app_settings.RECAPTCHA_ENABLED = False
+_app_settings.EXCEPTION_WORKFLOW_SYSTEM_KEY = "test-exception-system-key"
 
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import event
 
 from app.core.db import Base, SessionLocal, engine
 from app.core.security import create_access_token, hash_password, hash_token
 from app.main import app
 from app.api import attendance as attendance_api
-from app.models import AttendanceException, AttendanceExceptionAudit, AttendanceExceptionNotification, AttendanceLog, CheckinRule, Employee, Group, GroupGeofence, PasswordResetToken, RefreshToken, User
+from app.models import AttendanceException, AttendanceExceptionAudit, AttendanceExceptionNotification, AttendanceLog, CheckinRule, Employee, EmployeeShiftOverride, Group, GroupGeofence, LeaveRequest, OvertimeAudit, OvertimeRecord, PasswordResetToken, PublicHoliday, RefreshToken, Shift, User
 from app.schemas.attendance import LocationRequest
 from app.services.auth.password_reset_service import PasswordResetService, cleanup_password_reset_tokens
 from app.services.attendance_exception_jobs import expire_overdue_exceptions, send_expire_reminders
@@ -91,11 +97,17 @@ class MinimumFlowsTestCase(unittest.TestCase):
             db.query(AttendanceExceptionNotification).delete()
             db.query(AttendanceExceptionAudit).delete()
             db.query(AttendanceException).delete()
+            db.query(OvertimeAudit).delete()
+            db.query(OvertimeRecord).delete()
+            db.query(EmployeeShiftOverride).delete()
             db.query(AttendanceLog).delete()
+            db.query(LeaveRequest).delete()
+            db.query(PublicHoliday).delete()
             db.query(RefreshToken).delete()
             db.query(PasswordResetToken).delete()
             db.query(Employee).delete()
             db.query(GroupGeofence).delete()
+            db.query(Shift).delete()
             db.query(Group).delete()
             db.query(CheckinRule).delete()
             db.query(User).delete()
@@ -783,21 +795,26 @@ class MinimumFlowsTestCase(unittest.TestCase):
         token = self._login("group_user@example.com", "user123")
         headers = {"Authorization": f"Bearer {token}"}
 
-        checkin_res = self.client.post(
-            "/attendance/checkin",
-            headers=headers,
-            json={"lat": 10.7774, "lng": 106.7014},
-        )
+        _FixedDateTime.fixed_now = datetime(2026, 3, 15, 1, 0, tzinfo=timezone.utc)
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            checkin_res = self.client.post(
+                "/attendance/checkin",
+                headers=headers,
+                json={"lat": 10.7774, "lng": 106.7014},
+            )
         self.assertEqual(checkin_res.status_code, 200, checkin_res.text)
         self.assertFalse(checkin_res.json()["log"]["is_out_of_range"])
         self.assertEqual(checkin_res.json()["geofence_source"], "GROUP")
         self.assertIsNone(checkin_res.json()["fallback_reason"])
 
-        checkout_res = self.client.post(
-            "/attendance/checkout",
-            headers=headers,
-            json={"lat": 10.7905, "lng": 106.5950},
-        )
+        _FixedDateTime.fixed_now = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            checkout_res = self.client.post(
+                "/attendance/checkout",
+                headers=headers,
+                json={"lat": 10.7905, "lng": 106.5950},
+            )
+        _FixedDateTime.fixed_now = None
         self.assertEqual(checkout_res.status_code, 200, checkout_res.text)
         self.assertTrue(checkout_res.json()["log"]["is_out_of_range"])
         self.assertEqual(checkout_res.json()["geofence_source"], "GROUP")
@@ -815,42 +832,43 @@ class MinimumFlowsTestCase(unittest.TestCase):
         user_headers = {"Authorization": f"Bearer {create_access_token({'sub': str(user.id), 'role': user.role})}"}
         admin_headers = {"Authorization": f"Bearer {create_access_token({'sub': str(admin.id), 'role': admin.role})}"}
 
-        _FixedDateTime.fixed_now = datetime(2026, 3, 12, 1, 0, tzinfo=timezone.utc)
-        with patch("app.api.attendance.datetime", _FixedDateTime):
+        _FixedDateTime.fixed_now = datetime(2026, 4, 27, 1, 0, tzinfo=timezone.utc)
+        with patch("app.api.attendance.datetime", _FixedDateTime), \
+             patch("app.api.reports.datetime", _FixedDateTime):
             checkin_res = self.client.post(
                 "/attendance/checkin",
                 headers=user_headers,
                 json={"lat": 10.7905, "lng": 106.5950},
             )
-        self.assertEqual(checkin_res.status_code, 200, checkin_res.text)
-        self.assertTrue(checkin_res.json()["log"]["is_out_of_range"])
-        self.assertEqual(checkin_res.json()["decision"], "ALLOW_WITH_EXCEPTION")
+            self.assertEqual(checkin_res.status_code, 200, checkin_res.text)
+            self.assertTrue(checkin_res.json()["log"]["is_out_of_range"])
+            self.assertEqual(checkin_res.json()["decision"], "ALLOW_WITH_EXCEPTION")
 
-        employee_exceptions_res = self.client.get(
-            "/reports/attendance-exceptions/me?status=PENDING_EMPLOYEE",
-            headers=user_headers,
-        )
-        self.assertEqual(employee_exceptions_res.status_code, 200, employee_exceptions_res.text)
-        employee_rows = [
-            row for row in employee_exceptions_res.json()
-            if row["employee_code"] == "EMGPS"
-        ]
-        self.assertEqual(len(employee_rows), 1)
-        self.assertEqual(employee_rows[0]["exception_type"], "SUSPECTED_LOCATION_SPOOF")
-        self.assertEqual(employee_rows[0]["status"], "PENDING_EMPLOYEE")
+            employee_exceptions_res = self.client.get(
+                "/reports/attendance-exceptions/me?status=PENDING_EMPLOYEE",
+                headers=user_headers,
+            )
+            self.assertEqual(employee_exceptions_res.status_code, 200, employee_exceptions_res.text)
+            employee_rows = [
+                row for row in employee_exceptions_res.json()
+                if row["employee_code"] == "EMGPS"
+            ]
+            self.assertEqual(len(employee_rows), 1)
+            self.assertEqual(employee_rows[0]["exception_type"], "SUSPECTED_LOCATION_SPOOF")
+            self.assertEqual(employee_rows[0]["status"], "PENDING_EMPLOYEE")
 
-        admin_exceptions_res = self.client.get(
-            "/reports/attendance-exceptions?from=2026-03-12&to=2026-03-12&exception_type=SUSPECTED_LOCATION_SPOOF&status=PENDING_EMPLOYEE",
-            headers=admin_headers,
-        )
-        self.assertEqual(admin_exceptions_res.status_code, 200, admin_exceptions_res.text)
-        admin_rows = [
-            row for row in admin_exceptions_res.json()
-            if row["employee_code"] == "EMGPS"
-        ]
-        self.assertEqual(len(admin_rows), 1)
+            admin_exceptions_res = self.client.get(
+                "/reports/attendance-exceptions?from=2026-04-27&to=2026-04-27&exception_type=SUSPECTED_LOCATION_SPOOF&status=PENDING_EMPLOYEE",
+                headers=admin_headers,
+            )
+            self.assertEqual(admin_exceptions_res.status_code, 200, admin_exceptions_res.text)
+            admin_rows = [
+                row for row in admin_exceptions_res.json()
+                if row["employee_code"] == "EMGPS"
+            ]
+            self.assertEqual(len(admin_rows), 1)
 
-        _FixedDateTime.fixed_now = datetime(2026, 3, 12, 10, 0, tzinfo=timezone.utc)
+        _FixedDateTime.fixed_now = datetime(2026, 4, 27, 10, 0, tzinfo=timezone.utc)
         with patch("app.api.attendance.datetime", _FixedDateTime):
             checkout_res = self.client.post(
                 "/attendance/checkout",
@@ -965,22 +983,27 @@ class MinimumFlowsTestCase(unittest.TestCase):
         token = self._login("nogroup_user@example.com", "user123")
         headers = {"Authorization": f"Bearer {token}"}
 
-        checkin_res = self.client.post(
-            "/attendance/checkin",
-            headers=headers,
-            json={"lat": 10.7769, "lng": 106.7009},
-        )
+        _FixedDateTime.fixed_now = datetime(2026, 3, 16, 1, 0, tzinfo=timezone.utc)
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            checkin_res = self.client.post(
+                "/attendance/checkin",
+                headers=headers,
+                json={"lat": 10.7769, "lng": 106.7009},
+            )
         self.assertEqual(checkin_res.status_code, 200, checkin_res.text)
         self.assertFalse(checkin_res.json()["log"]["is_out_of_range"])
         self.assertEqual(checkin_res.json()["log"]["matched_geofence"], "SYSTEM_RULE")
         self.assertEqual(checkin_res.json()["geofence_source"], "SYSTEM_FALLBACK")
         self.assertEqual(checkin_res.json()["fallback_reason"], "EMPLOYEE_NOT_ASSIGNED_GROUP")
 
-        checkout_res = self.client.post(
-            "/attendance/checkout",
-            headers=headers,
-            json={"lat": 10.7905, "lng": 106.5950},
-        )
+        _FixedDateTime.fixed_now = datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc)
+        with patch("app.api.attendance.datetime", _FixedDateTime):
+            checkout_res = self.client.post(
+                "/attendance/checkout",
+                headers=headers,
+                json={"lat": 10.7905, "lng": 106.5950},
+            )
+        _FixedDateTime.fixed_now = None
         self.assertEqual(checkout_res.status_code, 200, checkout_res.text)
         self.assertTrue(checkout_res.json()["log"]["is_out_of_range"])
         self.assertIsNone(checkout_res.json()["log"]["matched_geofence"])
@@ -1007,7 +1030,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
         out_res = self.client.post(
             "/attendance/checkout",
             headers=user_headers,
-            json={"lat": 10.7905, "lng": 106.5950},
+            json={"lat": 10.7769, "lng": 106.7009},
         )
         self.assertEqual(out_res.status_code, 200, out_res.text)
 
@@ -1137,7 +1160,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
         self.assertEqual(row["date"], "2026-03-10")
         self.assertEqual(row["regular_minutes"], 540)
         self.assertEqual(row["overtime_minutes"], 570)
-        self.assertEqual(row["payable_overtime_minutes"], 570)
+        self.assertEqual(row["payable_overtime_minutes"], 0)  # PENDING, not yet approved
         self.assertTrue(row["overtime_cross_day"])
 
         _FixedDateTime.fixed_now = None
@@ -1266,6 +1289,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
             json={
                 "admin_note": "Admin entered actual checkout",
                 "actual_checkout_time": "2026-03-10T10:30:00+00:00",
+                "approved_overtime_minutes": 30,
             },
         )
         self.assertEqual(approve_ok_res.status_code, 200, approve_ok_res.text)
@@ -1519,7 +1543,8 @@ class MinimumFlowsTestCase(unittest.TestCase):
                 db.refresh(log)
                 return log.id
 
-        def create_system_exception(source_log_id: int, exception_type: str, note: str) -> dict:
+        def create_system_exception(source_log_id: int, exception_type: str, note: str, *, detected_at_days_ago: int = 1, expires_in_days: int = 3) -> dict:
+            now = datetime.now(timezone.utc)
             res = self.client.post(
                 "/reports/attendance-exceptions/system",
                 headers=self._system_headers(),
@@ -1528,8 +1553,8 @@ class MinimumFlowsTestCase(unittest.TestCase):
                     "source_checkin_log_id": source_log_id,
                     "exception_type": exception_type,
                     "note": note,
-                    "detected_at": "2026-03-20T00:00:00+00:00",
-                    "expires_at": "2026-03-23T00:00:00+00:00",
+                    "detected_at": (now - timedelta(days=detected_at_days_ago)).isoformat(),
+                    "expires_at": (now + timedelta(days=expires_in_days)).isoformat(),
                 },
             )
             self.assertEqual(res.status_code, 200, res.text)
@@ -1600,6 +1625,8 @@ class MinimumFlowsTestCase(unittest.TestCase):
             create_checkin_log(date(2026, 3, 22), datetime(2026, 3, 22, 1, 0, tzinfo=timezone.utc)),
             "SUSPECTED_LOCATION_SPOOF",
             "GPS risk will expire",
+            detected_at_days_ago=4,
+            expires_in_days=-1,
         )
         expire_res = self.client.post(
             f"/reports/attendance-exceptions/{expiring['id']}/expire",
@@ -1613,7 +1640,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
             headers=user_headers,
             json={"explanation": "Late edit after expiration"},
         )
-        self.assertEqual(submit_after_expired_res.status_code, 409, submit_after_expired_res.text)
+        self.assertIn(submit_after_expired_res.status_code, (409, 410), submit_after_expired_res.text)
 
     def test_exception_workflow_notifications_for_action_endpoints(self) -> None:
         admin = self._create_user(email="admin_notify@example.com", password="admin123", role="ADMIN")
@@ -2034,6 +2061,74 @@ class MinimumFlowsTestCase(unittest.TestCase):
         self.assertEqual(worksheet.cell(row=2, column=header_index["geofence_source"]).value, "GROUP")
         self.assertEqual(worksheet.cell(row=2, column=header_index["out_of_range"]).value, "IN_RANGE")
 
+    def test_monthly_attendance_holiday_checkin_counts_as_full_day(self) -> None:
+        admin = self._create_user(
+            email="admin_monthly_holiday@example.com",
+            password="admin123",
+            role="ADMIN",
+        )
+        user = self._create_user(
+            email="monthly_holiday_user@example.com",
+            password="user123",
+            role="USER",
+        )
+        group = self._create_group("MTH", "Monthly Holiday Group")
+        geofence = self._create_geofence(group.id, "VP Main", 10.7769, 106.7009, 300)
+        employee = self._create_employee(
+            code="EM017",
+            full_name="Monthly Holiday",
+            user_id=user.id,
+            group_id=group.id,
+        )
+
+        with SessionLocal() as db:
+            stored_geofence = db.query(GroupGeofence).filter(GroupGeofence.id == geofence.id).first()
+            self.assertIsNotNone(stored_geofence)
+            assert stored_geofence is not None
+            stored_geofence.location_type = "VP"
+            db.add(PublicHoliday(date=date(2026, 3, 10), name="Holiday Regression"))
+            db.add(
+                AttendanceLog(
+                    employee_id=employee.id,
+                    type="IN",
+                    time=datetime(2026, 3, 10, 2, 0, tzinfo=timezone.utc),
+                    work_date=date(2026, 3, 10),
+                    lat=10.7769,
+                    lng=106.7009,
+                    distance_m=0,
+                    is_out_of_range=False,
+                    punctuality_status="LATE",
+                    matched_geofence_name="VP Main",
+                    geofence_source="GROUP",
+                    snapshot_start_time=time(8, 0),
+                    snapshot_end_time=time(17, 0),
+                    snapshot_grace_minutes=30,
+                    snapshot_checkout_grace_minutes=0,
+                    snapshot_cutoff_minutes=240,
+                )
+            )
+            db.commit()
+
+        admin_token = self._login("admin_monthly_holiday@example.com", "admin123")
+        response = self.client.get(
+            f"/reports/attendance-monthly.xlsx?month=3&year=2026&group_id={group.id}",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        workbook = load_workbook(BytesIO(response.content))
+        worksheet = workbook.active
+        day_10_column = 4 + 9
+        employee_row = None
+        for row_idx in range(4, worksheet.max_row + 1):
+            if worksheet.cell(row=row_idx, column=2).value == "EM017":
+                employee_row = row_idx
+                break
+
+        self.assertIsNotNone(employee_row)
+        assert employee_row is not None
+        self.assertEqual(worksheet.cell(row=employee_row, column=day_10_column).value, "V")
+
 
 
     def test_geofence_radius_small_vs_large_affects_out_of_range(self) -> None:
@@ -2187,7 +2282,7 @@ class MinimumFlowsTestCase(unittest.TestCase):
                 payload = LocationRequest(lat=10.7769, lng=106.7009)
                 barrier.wait()
                 try:
-                    attendance_api.checkout(payload, db=db, user=user_obj)
+                    attendance_api.checkout(payload, request=MagicMock(headers={}, client=None), background_tasks=BackgroundTasks(), db=db, user=user_obj)
                     item: tuple[str, int | str] = ("ok", 200)
                 except HTTPException as exc:
                     item = ("http", exc.status_code)

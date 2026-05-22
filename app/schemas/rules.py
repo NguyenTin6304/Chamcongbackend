@@ -14,6 +14,9 @@ class RuleResponse(BaseModel):
     end_time: time
     checkout_grace_minutes: int
     cross_day_cutoff_minutes: int
+    default_annual_leave_days: float = 12.0
+    overtime_enabled: bool = True
+    overtime_minimum_minutes: int = 30
     radius_policy_warning: str | None = None
 
     @field_serializer("start_time")
@@ -98,6 +101,13 @@ class RuleUpdateRequest(BaseModel):
         ge=0,
         le=720,
     )
+    default_annual_leave_days: float | None = Field(
+        default=None,
+        ge=0,
+        le=365,
+    )
+    overtime_enabled: bool | None = None
+    overtime_minimum_minutes: int | None = Field(default=None, ge=0, le=480)
 
     @field_validator("start_time", mode="before")
     @classmethod

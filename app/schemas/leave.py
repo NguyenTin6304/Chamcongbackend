@@ -16,6 +16,21 @@ class LeaveRequestCreate(BaseModel):
         return self
 
 
+class AdminLeaveRequestCreate(BaseModel):
+    employee_id: int
+    leave_type: str = Field(pattern="^(PAID|UNPAID)$")
+    start_date: date
+    end_date: date
+    reason: str | None = Field(default=None, max_length=1000)
+    status: str = Field(default="APPROVED", pattern="^(PENDING|APPROVED)$")
+
+    @model_validator(mode="after")
+    def check_date_order(self) -> "AdminLeaveRequestCreate":
+        if self.end_date < self.start_date:
+            raise ValueError("end_date must be >= start_date")
+        return self
+
+
 class LeaveRequestApproveRequest(BaseModel):
     admin_note: str | None = Field(default=None, max_length=255)
 
@@ -30,6 +45,13 @@ class LeaveRequestRejectRequest(BaseModel):
         if not stripped:
             raise ValueError("admin_note must not be blank or whitespace-only")
         return stripped
+
+
+class LeaveBalanceResponse(BaseModel):
+    annual_quota: float | None  # null = unlimited
+    days_used: float
+    days_remaining: float | None  # null = unlimited
+    days_pending: float
 
 
 class LeaveRequestResponse(BaseModel):

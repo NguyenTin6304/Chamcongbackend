@@ -75,6 +75,59 @@ class GroupGeofence(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class Shift(Base):
+    """Named shift belonging to a group (Phase 3A — Shift Management).
+
+    Each group may have multiple shifts (e.g. Ca sáng / Ca chiều). Exactly one
+    shift per group may be marked is_default — enforced by a partial unique
+    index in the migration. Resolution order at checkin time:
+        EmployeeShiftOverride (Phase 3B) > Group default Shift > Group.end_time > CheckinRule
+    """
+    __tablename__ = "shifts"
+
+    id = Column(Integer, primary_key=True)
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    start_time = Column(Time, nullable=False)
+    end_time = Column(Time, nullable=False)
+    is_default = Column(Boolean, nullable=False, default=False, server_default="false")
+    active = Column(Boolean, nullable=False, default=True, server_default="true")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class EmployeeShiftOverride(Base):
+    """Per-employee shift override (Phase 3B).
+
+    A single override row per employee (UNIQUE on employee_id) — PUT replaces,
+    DELETE clears. Active only when effective_date <= today AND (end_date IS
+    NULL OR end_date >= today). Outside that window, resolution falls back to
+    the group's default Shift / Group.end_time / CheckinRule.
+
+    The single-row design keeps overlap validation trivial: there is no overlap
+    case to consider. If future use requires history or future-dated swaps,
+    relax the UNIQUE constraint and add range validation in a later phase.
+    """
+    __tablename__ = "employee_shift_overrides"
+
+    id = Column(Integer, primary_key=True)
+    employee_id = Column(
+        Integer,
+        ForeignKey("employees.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    shift_id = Column(Integer, ForeignKey("shifts.id"), nullable=False)
+    effective_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class Employee(Base):
     __tablename__ = "employees"
 
@@ -86,6 +139,7 @@ class Employee(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True, unique=True)
     group_id = Column(Integer, ForeignKey("groups.id"), nullable=True, index=True)
     active = Column(Boolean, default=True, nullable=False, server_default="true")
+    annual_leave_days = Column(Float, nullable=True)  # NULL = unlimited
     deleted_at = Column(DateTime(timezone=True), nullable=True, default=None)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -117,6 +171,9 @@ class CheckinRule(Base):
     checkout_grace_minutes = Column(Integer, nullable=False, default=0)
     # Fallback work-date cutoff in minutes from 00:00 VN.
     cross_day_cutoff_minutes = Column(Integer, nullable=False, default=240)
+    default_annual_leave_days = Column(Float, nullable=False, default=12.0, server_default='12.0')
+    overtime_enabled = Column(Boolean, nullable=False, default=True, server_default='true')
+    overtime_minimum_minutes = Column(Integer, nullable=False, default=30, server_default='30')
     active = Column(Boolean, default=True, nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -165,6 +222,11 @@ class AttendanceLog(Base):
     time_rule_fallback_reason = Column(String(100), nullable=True)
 
     address_text = Column(Text, nullable=True)
+
+    # Phase 4.1 — face capture
+    face_image_path = Column(String(500), nullable=True)
+    face_check_status = Column(String(30), nullable=True)  # CAPTURED | QUALITY_LOW | NOT_CAPTURED | SKIPPED
+    face_captured_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class AttendanceException(Base):
@@ -217,6 +279,7 @@ class ExceptionPolicy(Base):
     missed_checkout_deadline_hours = Column(Integer, nullable=True)
     location_risk_deadline_hours = Column(Integer, nullable=True)
     large_time_deviation_deadline_hours = Column(Integer, nullable=True)
+    face_not_captured_deadline_hours = Column(Integer, nullable=True)
     grace_period_days = Column(Integer, nullable=False, default=30)
     updated_at = Column(DateTime(timezone=True), nullable=True)
     updated_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
@@ -265,4 +328,56 @@ class LeaveRequest(Base):
     admin_note = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class OvertimeRecord(Base):
+    """Phase 2.5 — admin-approved overtime tracking.
+
+    One record per (employee, work_date). raw_minutes is computed at checkout
+    or exception approval; approved_minutes is set by admin (may differ from raw).
+    payable OT for reports = approved_minutes when status=APPROVED, else 0.
+    """
+    __tablename__ = "overtime_records"
+    __table_args__ = (
+        UniqueConstraint("employee_id", "work_date", name="uq_overtime_employee_workdate"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    employee_id = Column(Integer, ForeignKey("employees.id"), nullable=False, index=True)
+    work_date = Column(Date, nullable=False, index=True)
+    attendance_log_id = Column(Integer, ForeignKey("attendance_logs.id"), nullable=True)
+
+    raw_minutes = Column(Integer, nullable=False)
+    approved_minutes = Column(Integer, nullable=True)
+    status = Column(String(20), nullable=False, server_default="PENDING")  # PENDING | APPROVED | REJECTED
+    source = Column(String(30), nullable=False, server_default="AUTO_CHECKOUT")  # AUTO_CHECKOUT | EXCEPTION_APPROVAL
+
+    employee_note = Column(Text, nullable=True)
+    admin_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    admin_note = Column(Text, nullable=True)
+    decided_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Snapshot of shift definition at create time (rule changes later don't affect this record)
+    shift_start_snapshot = Column(Time, nullable=True)
+    shift_end_snapshot = Column(Time, nullable=True)
+    is_weekend = Column(Boolean, nullable=False, server_default="false")
+    is_holiday = Column(Boolean, nullable=False, server_default="false")
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class OvertimeAudit(Base):
+    """Audit trail for overtime_records — every state/value change."""
+    __tablename__ = "overtime_audits"
+
+    id = Column(Integer, primary_key=True)
+    overtime_id = Column(Integer, ForeignKey("overtime_records.id", ondelete="CASCADE"), nullable=False, index=True)
+    action = Column(String(30), nullable=False)  # CREATED | APPROVED | REJECTED | EDITED
+    actor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    from_status = Column(String(20), nullable=True)
+    to_status = Column(String(20), nullable=True)
+    from_minutes = Column(Integer, nullable=True)
+    to_minutes = Column(Integer, nullable=True)
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 

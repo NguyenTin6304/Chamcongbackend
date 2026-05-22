@@ -27,6 +27,9 @@ firebase-adminsdk-*.json
 .coverage
 htmlcov/
 
+# Runtime uploads (face images)
+uploads/
+
 # Build
 build/
 dist/
@@ -46,3 +49,4 @@ CLAUDE.md
 CODEBASE_OVERVIEW.md
 .claude
 docs
+DEPLOY.md

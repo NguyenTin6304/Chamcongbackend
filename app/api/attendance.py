@@ -11,8 +11,8 @@ from sqlalchemy.orm import Session, aliased
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_admin
-from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, ExceptionPolicy, Group, GroupGeofence, User
-from app.schemas.attendance import AttendanceDailyReportResponse, AttendanceLogResponse, AttendanceStatusResponse, CheckActionResponse, LocationRequest
+from app.models import AttendanceException, AttendanceLog, CheckinRule, Employee, EmployeeShiftOverride, ExceptionPolicy, Group, GroupGeofence, LeaveRequest, OvertimeRecord, PublicHoliday, Shift, User
+from app.schemas.attendance import AttendanceDailyReportResponse, AttendanceLogResponse, AttendanceStatusResponse, CheckActionResponse, LocationRequest, MyMonthlyStatsResponse, MyShiftResponse
 from app.services.attendance_time import (
     DEFAULT_CROSS_DAY_CUTOFF_MINUTES,
     VN_TZ,
@@ -41,6 +41,7 @@ from app.services.attendance_exception_notifications import (
     send_exception_notification_background,
 )
 from app.services.location_risk import LocationRiskInput, assess_location_risk
+from app.services.overtime_service import auto_create_pending_ot, fetch_payable_minutes_map
 from app.services.report_consistency import (
     compute_distance_consistency_warning,
     load_group_geofence_radius_maps,
@@ -65,10 +66,17 @@ class _EffectiveTimeRule(NamedTuple):
     cutoff_minutes: int
     source: str
     fallback_reason: str | None
+    # Phase 3C: name of the resolved Shift if source is GROUP_SHIFT /
+    # EMPLOYEE_SHIFT_OVERRIDE; None for legacy GROUP / SYSTEM_FALLBACK sources
+    # that don't have a named shift attached.
+    shift_name: str | None = None
 
 
 def _find_employee_for_user(db: Session, user: User) -> Employee | None:
-    return db.query(Employee).filter(Employee.user_id == user.id).first()
+    return db.query(Employee).filter(
+        Employee.user_id == user.id,
+        Employee.deleted_at.is_(None),
+    ).first()
 
 
 def _get_employee_for_user(db: Session, user: User) -> Employee:
@@ -154,6 +162,82 @@ def _get_effective_time_rule(db: Session, emp: Employee, fallback_rule: CheckinR
     if emp.group_id is not None:
         group = db.query(Group).filter(Group.id == emp.group_id).first()
         if group and group.active:
+            # Phase 3B: per-employee override has highest priority. Active when
+            # effective_date <= today_vn AND (end_date IS NULL OR end_date >= today_vn).
+            # Outside that window the override row exists but is ignored — we
+            # fall through to the group default Shift / Group.end_time chain.
+            today_vn = datetime.now(VN_TZ).date()
+            override_shift = (
+                db.query(Shift)
+                .join(
+                    EmployeeShiftOverride,
+                    EmployeeShiftOverride.shift_id == Shift.id,
+                )
+                .filter(
+                    EmployeeShiftOverride.employee_id == emp.id,
+                    EmployeeShiftOverride.effective_date <= today_vn,
+                    (EmployeeShiftOverride.end_date.is_(None))
+                    | (EmployeeShiftOverride.end_date >= today_vn),
+                    Shift.active.is_(True),
+                    # The override must point to a shift in the employee's
+                    # group — defensive check in case group changed after
+                    # override was set.
+                    Shift.group_id == group.id,
+                )
+                .first()
+            )
+            if override_shift:
+                return _EffectiveTimeRule(
+                    start_time=override_shift.start_time,
+                    grace_minutes=group.grace_minutes if group.grace_minutes is not None else fallback_rule.grace_minutes,
+                    end_time=override_shift.end_time,
+                    checkout_grace_minutes=(
+                        group.checkout_grace_minutes
+                        if group.checkout_grace_minutes is not None
+                        else fallback_rule.checkout_grace_minutes
+                    ),
+                    cutoff_minutes=(
+                        group.cross_day_cutoff_minutes
+                        if group.cross_day_cutoff_minutes is not None
+                        else system_cutoff_minutes
+                    ),
+                    source='EMPLOYEE_SHIFT_OVERRIDE',
+                    fallback_reason=None,
+                    shift_name=override_shift.name,
+                )
+
+            # Phase 3A: if group has a default Shift, use its start/end times.
+            # Grace/cutoff settings still come from group (or system fallback) —
+            # Shift only owns the shift window.
+            default_shift = (
+                db.query(Shift)
+                .filter(
+                    Shift.group_id == group.id,
+                    Shift.is_default.is_(True),
+                    Shift.active.is_(True),
+                )
+                .first()
+            )
+            if default_shift:
+                return _EffectiveTimeRule(
+                    start_time=default_shift.start_time,
+                    grace_minutes=group.grace_minutes if group.grace_minutes is not None else fallback_rule.grace_minutes,
+                    end_time=default_shift.end_time,
+                    checkout_grace_minutes=(
+                        group.checkout_grace_minutes
+                        if group.checkout_grace_minutes is not None
+                        else fallback_rule.checkout_grace_minutes
+                    ),
+                    cutoff_minutes=(
+                        group.cross_day_cutoff_minutes
+                        if group.cross_day_cutoff_minutes is not None
+                        else system_cutoff_minutes
+                    ),
+                    source='GROUP_SHIFT',
+                    fallback_reason=None,
+                    shift_name=default_shift.name,
+                )
+
             return _EffectiveTimeRule(
                 start_time=group.start_time or fallback_rule.start_time,
                 grace_minutes=group.grace_minutes if group.grace_minutes is not None else fallback_rule.grace_minutes,
@@ -968,16 +1052,24 @@ def _apply_exception_to_attendance_state(
     return attendance_state
 
 
-def _compute_payable_overtime_minutes(
-    overtime_minutes: int | None,
-    exception_status: str | None,
-    exception_type: str | None,
-) -> int | None:
-    if overtime_minutes is None:
-        return None
-    if is_pending_timesheet_exception(exception_status, exception_type):
-        return 0
-    return overtime_minutes
+def _get_pending_face_log_id(db: Session, employee_id: int, work_date) -> int | None:
+    """Return the most-recent log for work_date whose face has not been captured yet.
+
+    face_check_status IS NULL means the upload dialog was never completed
+    (e.g. employee refreshed the page right after checkin/checkout).
+    QUALITY_LOW / NOT_CAPTURED are terminal states — no retry needed.
+    """
+    log = (
+        db.query(AttendanceLog)
+        .filter(
+            AttendanceLog.employee_id == employee_id,
+            AttendanceLog.work_date == work_date,
+            AttendanceLog.face_check_status.is_(None),
+        )
+        .order_by(AttendanceLog.time.desc())
+        .first()
+    )
+    return log.id if log else None
 
 
 @router.get("/status", response_model=AttendanceStatusResponse)
@@ -1050,6 +1142,7 @@ def my_attendance_status(db: Session = Depends(get_db), user: User = Depends(get
                 message=message,
                 warning_code="MISSED_CHECKOUT" if missed_work_date is not None else None,
                 warning_date=missed_work_date,
+                pending_face_log_id=_get_pending_face_log_id(db, emp.id, open_work_date),
             )
 
     active_rule = _get_active_rule(db)
@@ -1071,6 +1164,7 @@ def my_attendance_status(db: Session = Depends(get_db), user: User = Depends(get
             message="Ban da hoan thanh phien lam viec cho ngay cong hien tai.",
             warning_code="AUTO_CLOSED" if auto_closed_work_date else None,
             warning_date=auto_closed_work_date,
+            pending_face_log_id=_get_pending_face_log_id(db, emp.id, current_work_date),
         )
 
     return AttendanceStatusResponse(
@@ -1494,6 +1588,21 @@ def checkout(
         _notify_new_exception(background_tasks, db, exception=new_exception, employee=emp)
         db.commit()
 
+    # Phase 2.5 — auto-create OT record if checkout exceeds shift end by threshold.
+    # Best-effort: failures here must not block a successful checkout. The
+    # checkout log itself is already committed above; this is a separate
+    # transaction so a rollback only discards the unflushed OT row.
+    try:
+        auto_create_pending_ot(db, log, checkin_log=open_checkin)
+        db.commit()
+    except Exception as ot_exc:
+        db.rollback()
+        import logging
+        logging.getLogger(__name__).warning(
+            "auto_create_pending_ot failed for employee=%s work_date=%s: %s",
+            emp.id, log.work_date, ot_exc,
+        )
+
     msg = f"Check-out thành công ({checkout_status}) cho ngày công {_format_vn_date(work_date)}."
     if out_of_range:
         msg = (
@@ -1537,6 +1646,249 @@ def my_logs(
 
     logs = q.order_by(AttendanceLog.time.desc()).all()
     return [_to_log_response(x) for x in logs]
+
+
+@router.get("/me/shift", response_model=MyShiftResponse)
+def my_resolved_shift(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Phase 3C — return the shift currently in effect for the caller.
+
+    Mirrors the same resolve chain used at checkin time so the home screen
+    always shows the right window before the user actually checks in.
+    """
+    emp = _get_employee_for_user(db, user)
+    active_rule = _get_active_rule(db)
+    rule = _get_effective_time_rule(db, emp, active_rule)
+    return MyShiftResponse(
+        shift_name=rule.shift_name,
+        start_time=rule.start_time.strftime("%H:%M"),
+        end_time=rule.end_time.strftime("%H:%M"),
+        source=rule.source,
+    )
+
+
+@router.get("/me/stats", response_model=MyMonthlyStatsResponse)
+def my_monthly_stats(
+    month: str | None = None,  # YYYY-MM; defaults to current month in VN time
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Phase 4 — Employee self stats for one month.
+
+    Returns attendance counts, leave usage, leave balance, and Plan-B
+    worked-minute totals (regular + approved OT) for the given month.
+    """
+    emp = _get_employee_for_user(db, user)
+
+    # ── Resolve target month ──────────────────────────────────────────────
+    if month is None:
+        today_vn = datetime.now(VN_TZ).date()
+        target_year, target_month = today_vn.year, today_vn.month
+    else:
+        try:
+            target_year, target_month = map(int, month.split("-", 1))
+            if not (2000 <= target_year <= 2100 and 1 <= target_month <= 12):
+                raise ValueError
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=422, detail="month must be YYYY-MM")
+
+    period_start = date(target_year, target_month, 1)
+    if target_month == 12:
+        next_first = date(target_year + 1, 1, 1)
+    else:
+        next_first = date(target_year, target_month + 1, 1)
+    period_last_day_of_month = next_first - timedelta(days=1)
+
+    today_vn = datetime.now(VN_TZ).date()
+    period_end = min(period_last_day_of_month, today_vn)
+    if period_end < period_start:
+        # Future month: nothing to count yet, but return empty stats.
+        period_end = period_start - timedelta(days=1)
+
+    # ── Attendance counts (per work_date IN-log) ──────────────────────────
+    in_logs = (
+        db.query(
+            AttendanceLog.work_date,
+            AttendanceLog.punctuality_status,
+        )
+        .filter(
+            AttendanceLog.employee_id == emp.id,
+            AttendanceLog.type == "IN",
+            AttendanceLog.work_date >= period_start,
+            AttendanceLog.work_date <= period_last_day_of_month,
+        )
+        .all()
+    )
+
+    checkin_dates: set[date] = set()
+    on_time_dates: set[date] = set()
+    late_dates: set[date] = set()
+    early_dates: set[date] = set()
+    for wd, status in in_logs:
+        if wd is None:
+            continue
+        checkin_dates.add(wd)
+        if status == "ON_TIME":
+            on_time_dates.add(wd)
+        elif status == "LATE":
+            late_dates.add(wd)
+        elif status == "EARLY":
+            early_dates.add(wd)
+
+    # ── Holidays in the period ────────────────────────────────────────────
+    holidays_in_period = {
+        h.date
+        for h in db.query(PublicHoliday)
+        .filter(PublicHoliday.date >= period_start, PublicHoliday.date <= period_end)
+        .all()
+    }
+
+    # ── Approved leave days that overlap the period ───────────────────────
+    overlapping_leaves = (
+        db.query(LeaveRequest)
+        .filter(
+            LeaveRequest.employee_id == emp.id,
+            LeaveRequest.status == "APPROVED",
+            LeaveRequest.start_date <= period_last_day_of_month,
+            LeaveRequest.end_date >= period_start,
+        )
+        .all()
+    )
+    leave_days_in_period: set[date] = set()
+    leave_days_used = 0.0
+    for req in overlapping_leaves:
+        eff_start = max(req.start_date, period_start)
+        eff_end = min(req.end_date, period_last_day_of_month)
+        cur = eff_start
+        while cur <= eff_end:
+            leave_days_in_period.add(cur)
+            cur += timedelta(days=1)
+        # leave days used count uses paid leave only for balance accuracy;
+        # for monthly summary, count all approved leave days within the month.
+        leave_days_used += float((eff_end - eff_start).days + 1)
+
+    pending_leaves = (
+        db.query(LeaveRequest)
+        .filter(
+            LeaveRequest.employee_id == emp.id,
+            LeaveRequest.status == "PENDING",
+            LeaveRequest.start_date <= period_last_day_of_month,
+            LeaveRequest.end_date >= period_start,
+        )
+        .all()
+    )
+    leave_days_pending = 0.0
+    for req in pending_leaves:
+        eff_start = max(req.start_date, period_start)
+        eff_end = min(req.end_date, period_last_day_of_month)
+        leave_days_pending += float((eff_end - eff_start).days + 1)
+
+    # ── Working days (weekdays in [start, end] minus holidays/leaves) ─────
+    working_days = 0
+    cur = period_start
+    while cur <= period_end:
+        is_weekend = cur.weekday() >= 5
+        if not is_weekend and cur not in holidays_in_period and cur not in leave_days_in_period:
+            working_days += 1
+        cur += timedelta(days=1)
+
+    checkins_total = len(checkin_dates)
+    absent_days = max(0, working_days - checkins_total)
+
+    # ── Worked minutes (regular + approved OT) ────────────────────────────
+    # Pair up IN/OUT logs by work_date and compute regular minutes per pair.
+    pair_logs = (
+        db.query(AttendanceLog)
+        .filter(
+            AttendanceLog.employee_id == emp.id,
+            AttendanceLog.work_date >= period_start,
+            AttendanceLog.work_date <= period_last_day_of_month,
+            AttendanceLog.type.in_(["IN", "OUT"]),
+        )
+        .order_by(AttendanceLog.work_date.asc(), AttendanceLog.time.asc())
+        .all()
+    )
+
+    by_date: dict[date, dict[str, AttendanceLog]] = {}
+    for log in pair_logs:
+        if log.work_date is None:
+            continue
+        bucket = by_date.setdefault(log.work_date, {})
+        if log.type == "IN" and "in" not in bucket:
+            bucket["in"] = log
+        elif log.type == "OUT":
+            # keep the latest OUT for the day
+            bucket["out"] = log
+
+    rule = _get_active_rule(db)
+    default_start = rule.start_time if rule else time(8, 0)
+    default_end = rule.end_time if rule else time(17, 0)
+
+    total_regular_minutes = 0
+    for wd, bucket in by_date.items():
+        in_log = bucket.get("in")
+        out_log = bucket.get("out")
+        if in_log is None or out_log is None:
+            continue
+        shift_start = (in_log.snapshot_start_time or default_start)
+        shift_end = (in_log.snapshot_end_time or default_end)
+        regular, _, _ = split_regular_overtime_minutes(
+            wd, in_log.time, out_log.time, shift_start, shift_end,
+        )
+        total_regular_minutes += regular
+
+    payable_map = fetch_payable_minutes_map(
+        db,
+        employee_ids=[emp.id],
+        from_date=period_start,
+        to_date=period_last_day_of_month,
+    )
+    total_approved_overtime_minutes = sum(payable_map.values())
+
+    # Pending OT: sum raw_minutes for status='PENDING' in the month
+    pending_rows = (
+        db.query(OvertimeRecord.raw_minutes)
+        .filter(
+            OvertimeRecord.employee_id == emp.id,
+            OvertimeRecord.status == "PENDING",
+            OvertimeRecord.work_date >= period_start,
+            OvertimeRecord.work_date <= period_last_day_of_month,
+        )
+        .all()
+    )
+    total_pending_overtime_minutes = sum(int(r[0] or 0) for r in pending_rows)
+
+    total_worked_minutes = total_regular_minutes + total_approved_overtime_minutes
+
+    # ── Leave balance for the year of this month ──────────────────────────
+    # Delegate to the canonical helper in leave.py so /attendance/me/stats and
+    # /leave-requests/me/balance can never disagree on remaining quota.
+    from app.api.leave import compute_leave_balance
+    balance = compute_leave_balance(emp, db, target_year)
+    quota = balance.annual_quota
+    balance_remaining = balance.days_remaining
+
+    return MyMonthlyStatsResponse(
+        month=f"{target_year:04d}-{target_month:02d}",
+        period_start=period_start,
+        period_end=period_end,
+        checkins_total=checkins_total,
+        checkins_on_time=len(on_time_dates),
+        checkins_late=len(late_dates),
+        checkins_early=len(early_dates),
+        absent_days=absent_days,
+        working_days=working_days,
+        leave_days_used=leave_days_used,
+        leave_days_pending=leave_days_pending,
+        annual_quota=quota,
+        leave_balance_remaining=balance_remaining,
+        total_worked_minutes=total_worked_minutes,
+        total_regular_minutes=total_regular_minutes,
+        total_approved_overtime_minutes=total_approved_overtime_minutes,
+        total_pending_overtime_minutes=total_pending_overtime_minutes,
+    )
 
 
 @router.get("/report/daily", response_model=list[AttendanceDailyReportResponse])
@@ -1657,6 +2009,15 @@ def daily_report_admin(
     group_ids = {int(row.group_id) for row in rows if row.group_id is not None}
     geofence_radius_map, group_max_radius_map = load_group_geofence_radius_maps(db, group_ids)
 
+    # Plan B: payable OT = approved_minutes from OvertimeRecord (not raw OT).
+    employee_ids_in_rows = list({int(row.employee_id) for row in rows if row.employee_id is not None})
+    payable_ot_map = fetch_payable_minutes_map(
+        db,
+        employee_ids=employee_ids_in_rows or None,
+        from_date=from_date,
+        to_date=to_date,
+    )
+
     response: list[AttendanceDailyReportResponse] = []
     for row in rows:
         checkin_status, checkout_status, attendance_state = _derive_daily_status(
@@ -1682,11 +2043,7 @@ def daily_report_admin(
             exception_status=exception_status,
             exception_type=exception_type,
         )
-        payable_overtime_minutes = _compute_payable_overtime_minutes(
-            overtime_minutes=overtime_minutes,
-            exception_status=exception_status,
-            exception_type=exception_type,
-        )
+        payable_overtime_minutes = payable_ot_map.get((int(row.employee_id), row.work_date), 0)
 
         matched_geofence = row.checkin_matched_geofence or row.checkout_matched_geofence
         geofence_source = _rank_to_geofence_source(row.geofence_source_rank)

@@ -9,14 +9,17 @@ from fastapi.responses import JSONResponse
 from app.api.attendance import router as attendance_router
 from app.api.auth import router as auth_router
 from app.api.employees import router as employees_router
+from app.api.face import router as face_router
 from app.api.geofences import router as geofences_router
 from app.api.groups import router as groups_router
 from app.api.leave import router as leave_router
+from app.api.overtime import router as overtime_router
 from app.api.reports import router as reports_router
 from app.api.rules import router as rules_router
 from app.api.users import router as users_router
 from app.core.config import settings
 from app.core.db import Base, SessionLocal, engine
+from app.scheduler import start_reminder_scheduler, stop_reminder_scheduler
 from app.services.auth.password_reset_service import cleanup_password_reset_tokens
 
 app = FastAPI(title="Attendance API")
@@ -62,6 +65,17 @@ def _password_reset_cleanup_loop() -> None:
 
 @app.on_event("startup")
 def startup_create_tables() -> None:
+    # Run pending Alembic migrations automatically on every startup.
+    # Safe to run repeatedly — Alembic is idempotent (skips already-applied migrations).
+    try:
+        from alembic.config import Config
+        from alembic import command as alembic_command
+        alembic_cfg = Config("alembic.ini")
+        alembic_command.upgrade(alembic_cfg, "head")
+        logger.info("Alembic migrations applied successfully")
+    except Exception:
+        logger.exception("Alembic migration failed — continuing startup anyway")
+
     # Keep Alembic as source of truth. Enable only for quick local demos.
     if settings.AUTO_CREATE_TABLES:
         Base.metadata.create_all(bind=engine)
@@ -77,6 +91,10 @@ def startup_create_tables() -> None:
             )
             _cleanup_thread.start()
 
+    # Always start the scheduler — it handles both FCM checkout reminders
+    # (skipped internally when FCM_ENABLED=False) and face image cleanup.
+    start_reminder_scheduler()
+
 
 @app.on_event("shutdown")
 def shutdown_background_jobs() -> None:
@@ -85,6 +103,7 @@ def shutdown_background_jobs() -> None:
     if _cleanup_thread and _cleanup_thread.is_alive():
         _cleanup_thread.join(timeout=3)
     _cleanup_thread = None
+    stop_reminder_scheduler()
 
 
 @app.get("/health")
@@ -165,7 +184,9 @@ app.include_router(groups_router)
 app.include_router(geofences_router)
 app.include_router(attendance_router)
 app.include_router(leave_router)
+app.include_router(overtime_router)
 app.include_router(reports_router)
 app.include_router(rules_router)
 app.include_router(auth_router)
 app.include_router(users_router)
+app.include_router(face_router, prefix="/face", tags=["face"])

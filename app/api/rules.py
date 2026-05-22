@@ -38,6 +38,9 @@ def _to_rule_response(rule: CheckinRule) -> RuleResponse:
         end_time=rule.end_time,
         checkout_grace_minutes=rule.checkout_grace_minutes,
         cross_day_cutoff_minutes=rule.cross_day_cutoff_minutes,
+        default_annual_leave_days=rule.default_annual_leave_days,
+        overtime_enabled=bool(rule.overtime_enabled) if rule.overtime_enabled is not None else True,
+        overtime_minimum_minutes=int(rule.overtime_minimum_minutes) if rule.overtime_minimum_minutes is not None else 30,
         radius_policy_warning=_radius_policy_warning(rule.radius_m),
     )
 
@@ -81,6 +84,21 @@ def update_active_rule(
                 if payload.cross_day_cutoff_minutes is not None
                 else DEFAULT_CROSS_DAY_CUTOFF_MINUTES
             ),
+            default_annual_leave_days=(
+                payload.default_annual_leave_days
+                if payload.default_annual_leave_days is not None
+                else 12.0
+            ),
+            overtime_enabled=(
+                payload.overtime_enabled
+                if payload.overtime_enabled is not None
+                else True
+            ),
+            overtime_minimum_minutes=(
+                payload.overtime_minimum_minutes
+                if payload.overtime_minimum_minutes is not None
+                else 30
+            ),
         )
         db.add(rule)
     else:
@@ -111,6 +129,14 @@ def update_active_rule(
             rule.cross_day_cutoff_minutes = payload.cross_day_cutoff_minutes
         elif rule.cross_day_cutoff_minutes is None:
             rule.cross_day_cutoff_minutes = DEFAULT_CROSS_DAY_CUTOFF_MINUTES
+
+        if payload.default_annual_leave_days is not None:
+            rule.default_annual_leave_days = payload.default_annual_leave_days
+
+        if payload.overtime_enabled is not None:
+            rule.overtime_enabled = payload.overtime_enabled
+        if payload.overtime_minimum_minutes is not None:
+            rule.overtime_minimum_minutes = payload.overtime_minimum_minutes
 
     try:
         db.commit()
@@ -164,6 +190,7 @@ def _policy_to_response(policy: ExceptionPolicy, db: Session) -> ExceptionPolicy
         missed_checkout_deadline_hours=policy.missed_checkout_deadline_hours,
         location_risk_deadline_hours=policy.location_risk_deadline_hours,
         large_time_deviation_deadline_hours=policy.large_time_deviation_deadline_hours,
+        face_not_captured_deadline_hours=policy.face_not_captured_deadline_hours,
         grace_period_days=policy.grace_period_days,
         updated_at=policy.updated_at,
         updated_by_name=updated_by_name,
@@ -198,6 +225,8 @@ def patch_exception_policy(
         policy.location_risk_deadline_hours = payload.location_risk_deadline_hours
     if "large_time_deviation_deadline_hours" in provided:
         policy.large_time_deviation_deadline_hours = payload.large_time_deviation_deadline_hours
+    if "face_not_captured_deadline_hours" in provided:
+        policy.face_not_captured_deadline_hours = payload.face_not_captured_deadline_hours
     if "grace_period_days" in provided and payload.grace_period_days is not None:
         policy.grace_period_days = payload.grace_period_days
 

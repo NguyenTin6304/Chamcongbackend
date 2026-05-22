@@ -221,6 +221,21 @@ def _fetch_daily_report_rows(
         case((AttendanceLog.type == "OUT", AttendanceLog.lng), else_=None)
     ).label("checkout_lng")
 
+    # Phase 4.1 — face capture fields per side (max() is safe because of
+    # UniqueConstraint(employee_id, work_date, type) — at most 1 IN and 1 OUT.
+    checkin_log_id_expr = func.max(
+        case((AttendanceLog.type == "IN", AttendanceLog.id), else_=None)
+    ).label("checkin_log_id")
+    checkout_log_id_expr = func.max(
+        case((AttendanceLog.type == "OUT", AttendanceLog.id), else_=None)
+    ).label("checkout_log_id")
+    checkin_face_status_expr = func.max(
+        case((AttendanceLog.type == "IN", AttendanceLog.face_check_status), else_=None)
+    ).label("checkin_face_status")
+    checkout_face_status_expr = func.max(
+        case((AttendanceLog.type == "OUT", AttendanceLog.face_check_status), else_=None)
+    ).label("checkout_face_status")
+
     q = (
         db.query(
             work_date_expr.label("work_date"),
@@ -247,6 +262,10 @@ def _fetch_daily_report_rows(
             checkin_lng_expr,
             checkout_lat_expr,
             checkout_lng_expr,
+            checkin_log_id_expr,
+            checkout_log_id_expr,
+            checkin_face_status_expr,
+            checkout_face_status_expr,
         )
         .join(Employee, Employee.id == AttendanceLog.employee_id)
         .outerjoin(Group, Group.id == Employee.group_id)
@@ -291,12 +310,20 @@ def _build_exception_map(
     if to_date:
         q = q.filter(AttendanceException.work_date <= to_date)
 
+    q = q.order_by(AttendanceException.id.asc())
+
     status_map: dict[tuple[int, date], tuple[str, str]] = {}
     for row in q.all():
         key = (row.employee_id, row.work_date)
         current = status_map.get(key)
         normalized_status = normalize_exception_status(row.status)
-        if current is None or not is_pending_exception_status(current[0]):
+        if current is None:
+            status_map[key] = (normalized_status, row.exception_type)
+        elif not is_pending_exception_status(current[0]):
+            # Current is resolved — overwrite with anything newer
+            status_map[key] = (normalized_status, row.exception_type)
+        elif row.exception_type == "MISSED_CHECKOUT" and current[1] != "MISSED_CHECKOUT":
+            # Both pending, but MISSED_CHECKOUT takes priority for display (shows 1/2T)
             status_map[key] = (normalized_status, row.exception_type)
     return status_map
 
@@ -546,7 +573,11 @@ def _get_exception_or_404(db: Session, exception_id: int) -> AttendanceException
 
 
 def _get_employee_for_user(db: Session, user: User) -> Employee:
-    employee = db.query(Employee).filter(Employee.user_id == user.id).first()
+    employee = (
+        db.query(Employee)
+        .filter(Employee.user_id == user.id, Employee.deleted_at.is_(None))
+        .first()
+    )
     if employee is None:
         raise HTTPException(status_code=400, detail="User is not linked to an employee")
     return employee
@@ -686,6 +717,14 @@ def _expire_overdue_now(db: Session) -> int:
         db.flush()
     return count
 
+def _format_hhmm(minutes: int | None) -> str:
+    """Convert minutes to HH:mm string, e.g. 510 → '08:30'. Returns '' if None/0."""
+    if not minutes:
+        return ""
+    h, m = divmod(abs(minutes), 60)
+    return f"{h:02d}:{m:02d}"
+
+
 def _to_excel_date(value: date | datetime | str | None) -> str | None:
     if value is None:
         return None
@@ -817,6 +856,14 @@ def list_attendance_logs_for_dashboard(
     rows = _fetch_daily_report_rows(db, effective_from, effective_to, None, group_id)
     exception_map = _build_exception_map(db, effective_from, effective_to, None, group_id)
 
+    # Phase 2.5 — payable OT now derives from approved overtime_records, not exception status
+    from app.services.overtime_service import fetch_payable_minutes_map
+    payable_ot_map = fetch_payable_minutes_map(
+        db,
+        from_date=effective_from,
+        to_date=effective_to,
+    )
+
     result: list[dict] = []
     for row in rows:
         checkin_status, checkout_status_val, attendance_state = _derive_daily_status(
@@ -852,10 +899,30 @@ def list_attendance_logs_for_dashboard(
         checkout_vn = to_vn_time(row.checkout_time).strftime("%H:%M") if row.checkout_time else "--:--"
 
         total_hours = "--"
+        worked_minutes: int | None = None
+        regular_minutes: int | None = None
+        overtime_minutes: int | None = None
+        payable_overtime_minutes: int | None = None
+        overtime_cross_day: bool | None = None
+
         if row.checkin_time and row.checkout_time:
             delta = row.checkout_time - row.checkin_time
             hours = max(0.0, delta.total_seconds() / 3600)
             total_hours = f"{hours:.1f}h"
+            if row.work_date:
+                # Same fallback as daily/monthly Excel for records missing shift snapshot
+                _shift_start = row.shift_start or time(8, 0)
+                _shift_end = row.shift_end or time(17, 0)
+                regular_minutes, overtime_minutes, overtime_cross_day = split_regular_overtime_minutes(
+                    row.work_date, row.checkin_time, row.checkout_time,
+                    _shift_start, _shift_end,
+                )
+                # Phase 2.5 (Plan B): payable_overtime sourced from approved overtime_records;
+                # worked_minutes = regular + admin-approved OT (only counted hours).
+                payable_overtime_minutes = payable_ot_map.get((int(row.employee_id), row.work_date), 0)
+                worked_minutes = (regular_minutes or 0) + (payable_overtime_minutes or 0)
+            else:
+                worked_minutes = max(0, int(delta.total_seconds() // 60))
 
         out_of_range_val = bool(row.out_of_range) if row.out_of_range is not None else False
         location_status = "outside" if out_of_range_val else "inside"
@@ -874,6 +941,11 @@ def list_attendance_logs_for_dashboard(
             "check_in_time": checkin_vn,
             "check_out_time": checkout_vn,
             "total_hours": total_hours,
+            "worked_minutes": worked_minutes,
+            "regular_minutes": regular_minutes,
+            "overtime_minutes": overtime_minutes,
+            "payable_overtime_minutes": payable_overtime_minutes,
+            "overtime_cross_day": overtime_cross_day,
             "location_status": location_status,
             "status": display_status,
             "attendance_status": attendance_state,
@@ -883,6 +955,10 @@ def list_attendance_logs_for_dashboard(
             "checkin_lng": float(row.checkin_lng) if row.checkin_lng is not None else None,
             "checkout_lat": float(row.checkout_lat) if row.checkout_lat is not None else None,
             "checkout_lng": float(row.checkout_lng) if row.checkout_lng is not None else None,
+            "checkin_log_id": int(row.checkin_log_id) if row.checkin_log_id is not None else None,
+            "checkout_log_id": int(row.checkout_log_id) if row.checkout_log_id is not None else None,
+            "checkin_face_status": row.checkin_face_status,
+            "checkout_face_status": row.checkout_face_status,
         })
 
     # Sort
@@ -1168,6 +1244,9 @@ def export_attendance_report_excel(
 
     rows = _fetch_daily_report_rows(db, from_date, to_date, employee_id, group_id)
     exception_status_map = _build_exception_map(db, from_date, to_date, employee_id, group_id)
+    # Phase 2.5 (Plan B): payable OT from approved overtime_records
+    from app.services.overtime_service import fetch_payable_minutes_map
+    payable_ot_lookup = fetch_payable_minutes_map(db, from_date=from_date, to_date=to_date)
     if status and status != "all":
         normalised_filter = status.upper()
         filtered_rows = []
@@ -1236,6 +1315,8 @@ def export_attendance_report_excel(
         "overtime_minutes",
         "payable_overtime_minutes",
         "overtime_cross_day",
+        "gio_lam",
+        "OT",
         "exception_status",
     ]
     ws.append(headers)
@@ -1291,11 +1372,9 @@ def export_attendance_report_excel(
             exception_status=exception_status,
             exception_type=exception_type,
         )
-        payable_overtime_minutes = _compute_payable_overtime_minutes(
-            overtime_minutes=overtime_minutes,
-            exception_status=exception_status,
-            exception_type=exception_type,
-        )
+        # Plan B: payable OT from approved overtime_records; "Giờ làm" = regular + payable
+        payable_overtime_minutes = payable_ot_lookup.get((int(row.employee_id), row.work_date), 0)
+        worked_total = (regular_minutes or 0) + (payable_overtime_minutes or 0)
 
         ws.append(
             [
@@ -1320,6 +1399,8 @@ def export_attendance_report_excel(
                 overtime_minutes,
                 payable_overtime_minutes,
                 "YES" if overtime_cross_day else "NO",
+                _format_hhmm(worked_total),
+                f"+{_format_hhmm(payable_overtime_minutes)}" if payable_overtime_minutes else "",
                 exception_status,
             ]
         )
@@ -1384,10 +1465,17 @@ def list_attendance_exceptions(
     normalized_exception_type = exception_type.strip().upper()
     if normalized_exception_type == "GPS_RISK":
         normalized_exception_type = "SUSPECTED_LOCATION_SPOOF"
-    if normalized_exception_type not in {"MISSED_CHECKOUT", "AUTO_CLOSED", "SUSPECTED_LOCATION_SPOOF", "LARGE_TIME_DEVIATION"}:
+    _allowed_exception_types = {
+        "MISSED_CHECKOUT",
+        "AUTO_CLOSED",
+        "SUSPECTED_LOCATION_SPOOF",
+        "LARGE_TIME_DEVIATION",
+        "FACE_NOT_CAPTURED",  # Phase 4.1
+    }
+    if normalized_exception_type not in _allowed_exception_types:
         raise HTTPException(
             status_code=400,
-            detail="exception_type must be MISSED_CHECKOUT, AUTO_CLOSED, SUSPECTED_LOCATION_SPOOF or LARGE_TIME_DEVIATION",
+            detail=f"exception_type must be one of: {', '.join(sorted(_allowed_exception_types))}",
         )
 
     normalized_status = status_filter.strip().upper() if status_filter else None
@@ -1737,6 +1825,7 @@ def approve_attendance_exception(
         raise HTTPException(status_code=400, detail="source check-in log not found")
 
     normalized_exception_type = _normalize_exception_type(exception.exception_type)
+    actual_checkout_utc = None
     if normalized_exception_type in {"AUTO_CLOSED", "MISSED_CHECKOUT"} and payload.actual_checkout_time is not None:
         actual_checkout_utc = normalize_utc(payload.actual_checkout_time)
         if actual_checkout_utc <= normalize_utc(source_checkin.time):
@@ -1782,6 +1871,41 @@ def approve_attendance_exception(
             employee=employee,
             admin_user=admin_user,
         )
+
+    # Phase 2.5 — gộp OT decision vào exception approval (MISSED_CHECKOUT/AUTO_CLOSED)
+    if (
+        normalized_exception_type in {"AUTO_CLOSED", "MISSED_CHECKOUT"}
+        and actual_checkout_utc is not None
+        and payload.approved_overtime_minutes is not None
+    ):
+        try:
+            from app.services.overtime_service import create_or_approve_from_exception
+            # Re-fetch the OUT log we just upserted so we link OT to it
+            out_log = (
+                db.query(AttendanceLog)
+                .filter(
+                    AttendanceLog.employee_id == exception.employee_id,
+                    AttendanceLog.work_date == exception.work_date,
+                    AttendanceLog.type == "OUT",
+                )
+                .order_by(AttendanceLog.id.desc())
+                .first()
+            )
+            if out_log is not None:
+                create_or_approve_from_exception(
+                    db,
+                    attendance_log=out_log,
+                    checkin_log=source_checkin,
+                    actual_checkout_time=actual_checkout_utc,
+                    approved_minutes=payload.approved_overtime_minutes,
+                    admin_id=admin_user.id,
+                    admin_note=note,
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            db.rollback()  # OT integration must not fail the exception approval
+
     db.commit()
     return _build_exception_response(db, exception.id)
 
@@ -2113,12 +2237,6 @@ def _derive_cell_code(row, exception_map: dict, holiday_set: set, geofence_locat
 
     # row exists → has checkin
     exc_status, exc_type = exception_map.get((row.employee_id, row.work_date), (None, None))
-    if exc_type == "MISSED_CHECKOUT":
-        return "1/2T"
-
-    punctuality = _rank_to_punctuality(row.punctuality_rank)
-    if punctuality == "LATE":
-        return "1/2T"
 
     geo_name = row.checkin_matched_geofence or row.checkout_matched_geofence
     geo_location_type = (
@@ -2126,6 +2244,25 @@ def _derive_cell_code(row, exception_map: dict, holiday_set: set, geofence_locat
         if geo_name else None
     )
     geo_type = _geofence_type(geo_name, geo_location_type)
+
+    # Priority 1: public holiday — full credit for any check-in, no hours/punctuality check.
+    if holiday_set:
+        if geo_type == "VP":
+            return "V"
+        if geo_type == "SITE":
+            return "S"
+        return "X"
+
+    # Priority 2: MISSED_CHECKOUT / LARGE_TIME_DEVIATION (not approved) → 1/2T
+    if exc_type in ("MISSED_CHECKOUT", "LARGE_TIME_DEVIATION") and exc_status != "APPROVED":
+        return "1/2T"
+
+    # Priority 3: late check-in → 1/2T
+    punctuality = _rank_to_punctuality(row.punctuality_rank)
+    if punctuality == "LATE":
+        return "1/2T"
+
+    # Priority 4: full / half day by geofence type and actual hours worked
     shift_start = row.shift_start or time(8, 0)
     shift_end = row.shift_end or time(17, 0)
     regular_minutes, _, _ = split_regular_overtime_minutes(
@@ -2141,7 +2278,6 @@ def _derive_cell_code(row, exception_map: dict, holiday_set: set, geofence_locat
         return "V" if full_day else "1/2V"
     if geo_type == "SITE":
         return "S" if full_day else "1/2S"
-    # SYSTEM_RULE
     return "X" if full_day else "1/2T"
 
 
@@ -2188,7 +2324,7 @@ _HDR_FILL     = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type=
 _SUBHDR_FILL  = PatternFill(start_color="DBEAFE", end_color="DBEAFE", fill_type="solid")
 _SUM_FILL     = PatternFill(start_color="ECFDF5", end_color="ECFDF5", fill_type="solid")
 
-_SUMMARY_HEADERS = ["Ngày công", "Tại VP", "Tại Site", "Nghỉ lễ (L)", "Nghỉ lương (P)", "Vắng (K)"]
+_SUMMARY_HEADERS = ["Ngày công", "Tại VP (V)", "Tại Site (S)", "Nghỉ lễ (L)", "Nghỉ lương (P)", "Vắng (K)"]
 _SUMMARY_KEYS    = ["ngay_cong", "tai_vp", "tai_site", "nghi_le", "nghi_p", "vang_k"]
 _SUMMARY_WIDTHS  = [10, 9, 9, 11, 13, 9]
 
@@ -2201,7 +2337,7 @@ _LEGEND_ITEMS = [
     ("1/2T", "Đi trễ hoặc quên chấm công"),
     ("K",    "Vắng không lương"),
     ("L",    "Nghỉ lễ"),
-    ("P",    "Nghỉ có lương (chờ module nghỉ phép)"),
+    ("P",    "Nghỉ có lương"),
 ]
 
 _CENTER  = Alignment(horizontal="center", vertical="center")
@@ -2230,13 +2366,20 @@ def _build_monthly_excel(
     matrix: dict[int, list[str]],
     summaries: dict[int, dict],
     holiday_set: set,
+    worked_min_by_emp: dict[int, int] | None = None,
+    payable_ot_min_by_emp: dict[int, int] | None = None,
+    total_worked_min: int = 0,
+    total_payable_ot_min: int = 0,
 ) -> StreamingResponse:
+    worked_min_by_emp = worked_min_by_emp or {}
+    payable_ot_min_by_emp = payable_ot_min_by_emp or {}
     last_day = days[-1]
 
-    # Column layout: A=1 STT | B=2 MãNV | C=3 Tên | D..=day cols | then summary cols
-    DATA_COL = 4
-    SUM_COL  = DATA_COL + last_day
-    TOT_COLS = SUM_COL + len(_SUMMARY_HEADERS) - 1
+    # Column layout: A=1 STT | B=2 MãNV | C=3 Tên | D..=day cols | summary cols | hour cols
+    DATA_COL  = 4
+    SUM_COL   = DATA_COL + last_day
+    HOUR_COL  = SUM_COL + len(_SUMMARY_HEADERS)   # "Giờ làm" column
+    TOT_COLS  = HOUR_COL + 1                       # +1 for "OT" column
 
     # Per-day metadata
     day_wd  = [date(year, month, d).weekday() for d in days]   # 0=Mon … 6=Sun
@@ -2286,6 +2429,13 @@ def _build_monthly_excel(
         c.fill      = _SUM_FILL
         c.font      = Font(bold=True, size=10, color="065F46")
         c.alignment = _WRAP
+
+    for col, label in ((HOUR_COL, "Giờ làm"), (HOUR_COL + 1, "OT")):
+        c = ws.cell(2, col)
+        c.value     = label
+        c.fill      = PatternFill(start_color="FEF9C3", end_color="FEF9C3", fill_type="solid")
+        c.font      = Font(bold=True, size=10, color="92400E")
+        c.alignment = _CENTER
     ws.row_dimensions[2].height = 22
 
     # ── Row 3: Weekday names ──────────────────────────────────────────────────
@@ -2307,6 +2457,9 @@ def _build_monthly_excel(
 
     for i in range(len(_SUMMARY_HEADERS)):
         ws.cell(3, SUM_COL + i).fill = _SUM_FILL
+    _HOUR_HDR_FILL = PatternFill(start_color="FEF9C3", end_color="FEF9C3", fill_type="solid")
+    ws.cell(3, HOUR_COL).fill     = _HOUR_HDR_FILL
+    ws.cell(3, HOUR_COL + 1).fill = _HOUR_HDR_FILL
     ws.row_dimensions[3].height = 15
 
     # ── Data rows ─────────────────────────────────────────────────────────────
@@ -2362,10 +2515,47 @@ def _build_monthly_excel(
             cell.font      = (Font(bold=True, size=10, color="065F46") if val > 0
                                else Font(size=10, color="9CA3AF"))
 
+        # Per-employee Giờ làm + OT đã duyệt
+        emp_worked = worked_min_by_emp.get(eid, 0)
+        emp_payable = payable_ot_min_by_emp.get(eid, 0)
+        gio_lam_cell = ws.cell(r, HOUR_COL)
+        gio_lam_cell.value = _format_hhmm(emp_worked) if emp_worked else ""
+        gio_lam_cell.alignment = _CENTER
+        gio_lam_cell.font = (Font(bold=True, size=10, color="065F46") if emp_worked > 0
+                             else Font(size=10, color="9CA3AF"))
+        ot_cell = ws.cell(r, HOUR_COL + 1)
+        ot_cell.value = f"+{_format_hhmm(emp_payable)}" if emp_payable else ""
+        ot_cell.alignment = _CENTER
+        ot_cell.font = (Font(bold=True, size=10, color="C2410C") if emp_payable > 0
+                        else Font(size=10, color="9CA3AF"))
+
         ws.row_dimensions[r].height = 18
 
+    # ── Totals row ────────────────────────────────────────────────────────────
+    tot_r = 3 + len(emp_order) + 1
+    _TOT_FILL = PatternFill(start_color="DBEAFE", end_color="DBEAFE", fill_type="solid")
+    _TOT_FONT = Font(bold=True, size=10, color="1E3A8A")
+    for col in range(1, TOT_COLS + 1):
+        ws.cell(tot_r, col).fill = _TOT_FILL
+    ws.cell(tot_r, 3).value     = "TỔNG CỘNG"
+    ws.cell(tot_r, 3).font      = _TOT_FONT
+    ws.cell(tot_r, 3).alignment = _LEFT
+    gio_lam_label = _format_hhmm(total_worked_min) or "00:00"
+    ot_label      = f"+{_format_hhmm(total_payable_ot_min)}" if total_payable_ot_min else ""
+    # Place totals in the last two summary columns
+    tot_gio_col = SUM_COL + len(_SUMMARY_HEADERS)
+    ws.cell(tot_r, tot_gio_col).value     = gio_lam_label
+    ws.cell(tot_r, tot_gio_col).font      = _TOT_FONT
+    ws.cell(tot_r, tot_gio_col).alignment = _CENTER
+    ws.cell(tot_r, tot_gio_col).fill      = _TOT_FILL
+    ws.cell(tot_r, tot_gio_col + 1).value     = ot_label
+    ws.cell(tot_r, tot_gio_col + 1).font      = Font(bold=True, size=10, color="D97706")
+    ws.cell(tot_r, tot_gio_col + 1).alignment = _CENTER
+    ws.cell(tot_r, tot_gio_col + 1).fill      = _TOT_FILL
+    ws.row_dimensions[tot_r].height = 18
+
     # ── Legend ────────────────────────────────────────────────────────────────
-    legend_row = 3 + len(emp_order) + 2
+    legend_row = 3 + len(emp_order) + 3
     ws.cell(legend_row, 1).value = "CHÚ THÍCH:"
     ws.cell(legend_row, 1).font  = Font(bold=True, size=10)
 
@@ -2392,6 +2582,8 @@ def _build_monthly_excel(
         ws.column_dimensions[get_column_letter(DATA_COL + i)].width = 4.5
     for i, w in enumerate(_SUMMARY_WIDTHS):
         ws.column_dimensions[get_column_letter(SUM_COL + i)].width = w
+    ws.column_dimensions[get_column_letter(HOUR_COL)].width     = 9
+    ws.column_dimensions[get_column_letter(HOUR_COL + 1)].width = 8
 
     # ── Freeze: rows 1-3 + cols A-C ──────────────────────────────────────────
     ws.freeze_panes = "D4"
@@ -2505,7 +2697,8 @@ def export_monthly_attendance_excel(
                     is_holiday = day_date in holiday_set
                     codes.append(_derive_cell_code(row, exception_map, {day_date} if is_holiday else set(), geofence_location_map))
                 else:
-                    codes.append("")  # weekend, no work
+                    # No checkin: show L if public holiday, blank otherwise
+                    codes.append("L" if day_date in holiday_set else "")
             else:
                 row = emp_rows.get(day_date)
                 is_holiday = day_date in holiday_set
@@ -2528,6 +2721,31 @@ def export_monthly_attendance_excel(
         eid: _calc_summary(codes) for eid, codes in matrix.items()
     }
 
+    # --- Compute per-employee + total worked / OT minutes (Phase 2.5 plan B) ---
+    from app.services.overtime_service import fetch_payable_minutes_map
+    payable_ot_lookup = fetch_payable_minutes_map(db, from_date=from_date, to_date=to_date)
+
+    worked_min_by_emp: dict[int, int] = {}
+    payable_ot_min_by_emp: dict[int, int] = {}
+    total_worked_min = 0
+    total_payable_ot_min = 0
+    for row in rows:
+        if row.checkin_time and row.checkout_time and row.work_date:
+            _shift_start = row.shift_start or time(8, 0)
+            _shift_end   = row.shift_end   or time(17, 0)
+            _reg, _ot, _ = split_regular_overtime_minutes(
+                row.work_date, row.checkin_time, row.checkout_time,
+                _shift_start, _shift_end,
+            )
+            eid = int(row.employee_id)
+            # Plan B: payable from approved overtime_records; worked = regular + payable
+            _payable = payable_ot_lookup.get((eid, row.work_date), 0)
+            _worked = _reg + _payable
+            worked_min_by_emp[eid] = worked_min_by_emp.get(eid, 0) + _worked
+            payable_ot_min_by_emp[eid] = payable_ot_min_by_emp.get(eid, 0) + _payable
+            total_worked_min += _worked
+            total_payable_ot_min += _payable
+
     return _build_monthly_excel(
         year=year,
         month=month,
@@ -2538,4 +2756,8 @@ def export_monthly_attendance_excel(
         matrix=matrix,
         summaries=summaries,
         holiday_set=holiday_set,
+        worked_min_by_emp=worked_min_by_emp,
+        payable_ot_min_by_emp=payable_ot_min_by_emp,
+        total_worked_min=total_worked_min,
+        total_payable_ot_min=total_payable_ot_min,
     )
