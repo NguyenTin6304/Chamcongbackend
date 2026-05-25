@@ -176,6 +176,7 @@ def send_exception_notification_background(
     payload: ExceptionNotificationMail,
     notification_id: int | None = None,
     fcm_token: str | None = None,
+    recipient_user_id: int | None = None,
 ) -> None:
     # ── Email ─────────────────────────────────────────────────────────────────
     email_failed = False
@@ -202,7 +203,20 @@ def send_exception_notification_background(
             body = _PUSH_BODIES.get(payload.event_type, "")
             route = _PUSH_ROUTES.get(payload.event_type, "")
             data = {"route": route} if route else None
-            send_push_notification(fcm_token.strip(), title, body, data=data)
+
+            def _clear_stale_token(token: str) -> None:
+                if recipient_user_id is None:
+                    return
+                try:
+                    with SessionLocal() as clean_db:
+                        user = clean_db.query(User).filter(User.id == recipient_user_id).first()
+                        if user and user.fcm_token == token:
+                            user.fcm_token = None
+                            clean_db.commit()
+                except Exception:
+                    logger.exception("Failed to clear stale FCM token for user_id=%s", recipient_user_id)
+
+            send_push_notification(fcm_token.strip(), title, body, data=data, on_unregistered=_clear_stale_token)
             if email_failed:
                 logger.info(
                     "FCM push sent despite email failure. event=%s", payload.event_type
