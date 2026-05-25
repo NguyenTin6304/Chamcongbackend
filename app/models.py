@@ -1,7 +1,12 @@
 ﻿from datetime import time
 
-from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, Text, Time, UniqueConstraint
+from sqlalchemy import JSON, Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, Text, Time, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
+
+# Cross-database JSON type — JSONB on PostgreSQL (indexable), plain JSON on
+# SQLite so the unit tests can run against an in-memory database.
+JSONType = JSON().with_variant(JSONB(), "postgresql")
 
 from app.core.db import Base
 
@@ -227,6 +232,49 @@ class AttendanceLog(Base):
     face_image_path = Column(String(500), nullable=True)
     face_check_status = Column(String(30), nullable=True)  # CAPTURED | QUALITY_LOW | NOT_CAPTURED | SKIPPED
     face_captured_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Phase 4.2 — face verification
+    face_embedding = Column(JSONType, nullable=True)         # list[float] 512 dims ArcFace
+    face_match_score = Column(Float, nullable=True)          # cosine similarity vs reference (0..1)
+    face_verify_status = Column(String(30), nullable=True)   # MATCH | LOW_CONFIDENCE | MISMATCH | SKIPPED
+
+
+class EmployeeFaceReference(Base):
+    """Phase 4.2 — One reference face per employee.
+
+    Embedding is extracted by `app.services.face_embedding.extract_embedding`
+    when the admin sets the reference. Stored as JSONB so PostgreSQL can index
+    later if needed; comparison is done in Python via cosine similarity.
+    """
+
+    __tablename__ = "employee_face_references"
+
+    id = Column(Integer, primary_key=True)
+    employee_id = Column(
+        Integer,
+        ForeignKey("employees.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    log_id_source = Column(
+        Integer,
+        ForeignKey("attendance_logs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    face_embedding = Column(JSONType, nullable=False)
+    set_by_admin_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
 
 
 class AttendanceException(Base):

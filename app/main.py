@@ -101,6 +101,20 @@ def startup_create_tables() -> None:
     # (skipped internally when FCM_ENABLED=False) and face image cleanup.
     start_reminder_scheduler()
 
+    # Pre-warm insightface model in background so the first /face/upload request
+    # is not blocked by the ~30-60s ONNX cold-start on Windows.
+    def _warmup_face_model() -> None:
+        try:
+            from app.services.face_embedding import warmup_model
+            if warmup_model():
+                logger.info("insightface model pre-loaded at startup")
+            else:
+                logger.info("insightface not available — face embedding disabled")
+        except Exception:
+            logger.exception("insightface warmup failed — first upload will trigger lazy load")
+
+    threading.Thread(target=_warmup_face_model, name="face-model-warmup", daemon=True).start()
+
 
 @app.on_event("shutdown")
 def shutdown_background_jobs() -> None:

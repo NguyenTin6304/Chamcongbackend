@@ -235,6 +235,19 @@ def _fetch_daily_report_rows(
     checkout_face_status_expr = func.max(
         case((AttendanceLog.type == "OUT", AttendanceLog.face_check_status), else_=None)
     ).label("checkout_face_status")
+    # Phase 4.2 — face verification per checkin/checkout side.
+    checkin_verify_status_expr = func.max(
+        case((AttendanceLog.type == "IN", AttendanceLog.face_verify_status), else_=None)
+    ).label("checkin_verify_status")
+    checkout_verify_status_expr = func.max(
+        case((AttendanceLog.type == "OUT", AttendanceLog.face_verify_status), else_=None)
+    ).label("checkout_verify_status")
+    checkin_match_score_expr = func.max(
+        case((AttendanceLog.type == "IN", AttendanceLog.face_match_score), else_=None)
+    ).label("checkin_match_score")
+    checkout_match_score_expr = func.max(
+        case((AttendanceLog.type == "OUT", AttendanceLog.face_match_score), else_=None)
+    ).label("checkout_match_score")
 
     q = (
         db.query(
@@ -266,6 +279,10 @@ def _fetch_daily_report_rows(
             checkout_log_id_expr,
             checkin_face_status_expr,
             checkout_face_status_expr,
+            checkin_verify_status_expr,
+            checkout_verify_status_expr,
+            checkin_match_score_expr,
+            checkout_match_score_expr,
         )
         .join(Employee, Employee.id == AttendanceLog.employee_id)
         .outerjoin(Group, Group.id == Employee.group_id)
@@ -959,6 +976,10 @@ def list_attendance_logs_for_dashboard(
             "checkout_log_id": int(row.checkout_log_id) if row.checkout_log_id is not None else None,
             "checkin_face_status": row.checkin_face_status,
             "checkout_face_status": row.checkout_face_status,
+            "checkin_verify_status": row.checkin_verify_status,
+            "checkout_verify_status": row.checkout_verify_status,
+            "checkin_match_score": float(row.checkin_match_score) if row.checkin_match_score is not None else None,
+            "checkout_match_score": float(row.checkout_match_score) if row.checkout_match_score is not None else None,
         })
 
     # Sort
@@ -1471,6 +1492,8 @@ def list_attendance_exceptions(
         "SUSPECTED_LOCATION_SPOOF",
         "LARGE_TIME_DEVIATION",
         "FACE_NOT_CAPTURED",  # Phase 4.1
+        "FACE_MISMATCH",  # Phase 4.2
+        "FACE_LOW_CONFIDENCE",  # Phase 4.2
     }
     if normalized_exception_type not in _allowed_exception_types:
         raise HTTPException(

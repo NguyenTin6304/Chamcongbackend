@@ -114,11 +114,17 @@ def send_checkout_reminders() -> None:
         if not user or not user.fcm_token:
             continue
 
+        def _clear_token(token: str) -> None:
+            if user.fcm_token == token:
+                user.fcm_token = None
+                db.commit()
+
         ok = send_push_notification(
             user.fcm_token,
             "Nhắc checkout",
             "Còn 15 phút hết ca, đừng quên checkout!",
             data={"route": "/home"},
+            on_unregistered=_clear_token,
         )
         if ok:
             sent_count += 1
